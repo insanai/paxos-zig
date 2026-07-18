@@ -1,0 +1,6 @@
+.DS_Store
+.zig-cache/
+zig-out/
+integration/consumer/.zig-cache/
+integration/consumer/zig-out/
+benchmarks/omnipaxos-rust/target/

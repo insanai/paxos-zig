@@ -1,0 +1,13 @@
+steps:
+  zig:
+    image: ghcr.io/ziglang/zig:0.16.0
+    commands:
+      - zig build fmt
+      - zig build test
+      - zig build run
+      - zig build benchmark-zig
+
+  rust-benchmark:
+    image: rust:1.95
+    commands:
+      - cargo run --release --locked --manifest-path benchmarks/omnipaxos-rust/Cargo.toml
