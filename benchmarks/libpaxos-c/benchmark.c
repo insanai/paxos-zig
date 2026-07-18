@@ -36,7 +36,8 @@ static uint64_t now_nanoseconds(void)
     return (uint64_t)time.tv_sec * 1000000000ULL + (uint64_t)time.tv_nsec;
 }
 
-static void prepare_one(struct proposer *proposer, struct acceptor **acceptors)
+static void prepare_one(struct proposer *proposer, struct acceptor **acceptors,
+    uint64_t *messages)
 {
     paxos_prepare prepare;
     proposer_prepare(proposer, &prepare);
@@ -44,10 +45,12 @@ static void prepare_one(struct proposer *proposer, struct acceptor **acceptors)
     for (int index = 0; index < node_count; index++) {
         paxos_message reply = {0};
         paxos_prepare retry = {0};
+        *messages += 1; /* prepare delivered to one acceptor */
         if (!acceptor_receive_prepare(acceptors[index], &prepare, &reply))
             fail("acceptor rejected a fresh prepare");
         if (reply.type != PAXOS_PROMISE)
             fail("prepare did not produce a promise");
+        *messages += 1; /* promise returned to the proposer */
         if (proposer_receive_promise(proposer, &reply.u.promise, &retry))
             fail("fresh prepare was preempted");
         paxos_message_destroy(&reply);
@@ -59,10 +62,12 @@ static struct sample run_sample(void)
     struct proposer *proposer = proposer_new(0, node_count);
     struct learner *learner = learner_new(node_count);
     struct acceptor *acceptors[node_count];
+    uint64_t setup_messages = 0;
+    uint64_t messages = 0;
     for (int index = 0; index < node_count; index++)
         acceptors[index] = acceptor_new(index);
     for (int index = 0; index < preexecution_window; index++)
-        prepare_one(proposer, acceptors);
+        prepare_one(proposer, acceptors, &setup_messages);
 
     uint64_t checksum = 0;
     const uint64_t started = now_nanoseconds();
@@ -75,12 +80,14 @@ static struct sample run_sample(void)
 
         for (int index = 0; index < node_count; index++) {
             replies[index] = (paxos_message){0};
+            messages += 1; /* accept delivered to one acceptor */
             if (!acceptor_receive_accept(acceptors[index], &accept, &replies[index]))
                 fail("acceptor rejected a prepared accept");
             if (replies[index].type != PAXOS_ACCEPTED)
                 fail("accept did not produce an accepted message");
         }
         for (int index = 0; index < node_count; index++) {
+            messages += 1; /* accepted returned to the co-located learner+proposer */
             learner_receive_accepted(learner, &replies[index].u.accepted);
             proposer_receive_accepted(proposer, &replies[index].u.accepted);
             paxos_message_destroy(&replies[index]);
@@ -93,7 +100,10 @@ static struct sample run_sample(void)
             fail("delivered value has the wrong size");
         checksum += *(const uint64_t *)delivered.value.paxos_value_val;
         paxos_accepted_destroy(&delivered);
-        prepare_one(proposer, acceptors);
+        /* The phase-one preexecution window advances inside the timed
+         * region: LibPaxos3 pays prepare+promise per value here, a heavier
+         * protocol path than the stable-leader 6-message path. */
+        prepare_one(proposer, acceptors, &messages);
     }
     const uint64_t elapsed = now_nanoseconds() - started;
 
@@ -104,7 +114,7 @@ static struct sample run_sample(void)
 
     return (struct sample){
         .checksum = checksum,
-        .messages = (uint64_t)value_count * 12,
+        .messages = messages,
         .nanoseconds = elapsed,
     };
 }
@@ -130,11 +140,26 @@ int main(void)
     const struct sample result = samples[sample_count / 2];
 
     printf("implementation: LibPaxos3 d255f8b (C)\n");
+    printf("path:           per-value accept plus phase-one preexecution;\n");
+    printf("                heavier than the 6-message stable-leader path\n");
     printf("values:         %d\n", value_count);
     printf("median_ns:      %" PRIu64 "\n", result.nanoseconds);
     printf("ns_per_value:   %.2f\n", (double)result.nanoseconds / value_count);
-    printf("messages:       %" PRIu64 "\n", result.messages);
+    printf("messages:       %" PRIu64 " (measured)\n", result.messages);
     printf("messages/value: %.2f\n", (double)result.messages / value_count);
-    printf("checksum:       %" PRIu64 "\n\n", result.checksum);
+    printf("checksum:       %" PRIu64 "\n", result.checksum);
+    printf("{\"impl\":\"libpaxos3\",\"workload\":\"u64-3n\","
+           "\"mode\":\"sync-preexec\",\"values\":%d,\"nodes\":%d,"
+           "\"payload_bytes\":8,\"ns_total_median\":%" PRIu64 ","
+           "\"ns_per_value\":%.2f,\"messages\":%" PRIu64 ","
+           "\"checksum\":%" PRIu64 "}\n\n",
+        value_count, node_count, result.nanoseconds,
+        (double)result.nanoseconds / value_count, result.messages,
+        result.checksum);
+    const uint64_t expected = (uint64_t)value_count * (value_count + 1) / 2;
+    if (result.checksum != expected) {
+        fprintf(stderr, "SELF-CHECK FAILED: checksum mismatch\n");
+        return 1;
+    }
     return 0;
 }
