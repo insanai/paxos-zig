@@ -155,20 +155,23 @@ decided membership.
   new checkpoint epoch before the bound is reached.
 - Logical ticks provide automatic ballot election, priority, heartbeats, and
   retransmission. Competing candidates remain safe. No wall clock is read.
-- Commit delivery is at least once across process crashes. Persist the state
-  machine's applied slot with its state and ignore already-applied slots.
+- `committedSlice()` releases a contiguous prefix during live transitions, but
+  it is not an application-recovery feed. Persist the state machine's applied
+  slot with its state, replay missing committed journal values explicitly, and
+  tolerate duplicate delivery around recovery.
 - Values are copied into protocol state and messages. Prefer fixed-size command
   records or content-addressed IDs; avoid borrowed pointers and slices.
 - Node IDs are non-zero and must never be reused for a different logical member.
 
 See [the rendered book](docs/part-time-parliament.pdf) and its
-[Typst source](docs/book.typ) for the derivation, integration guide, failure
-model, testing strategy, and production checklist. The original paper is kept
-at `docs/lamport-paxos.pdf`.
+[Typst source](docs/book.typ) for the learning path, derivation, API contract,
+host-integration guide, evidence audit, and production checklist. The original
+paper is kept at `docs/lamport-paxos.pdf`.
 
-See the exact [OmniPaxos feature map](docs/features.md) for implemented
-capabilities, Zig-native integration boundaries, and deliberate differences.
-The enforceable project rules are in [STYLE.md](STYLE.md).
+The exact capability boundaries are in
+[the advanced-features chapter](docs/book/04_features.typ), and the enforced
+source conventions are explained in
+[the reviewable-code chapter](docs/book/04_style.typ).
 
 ## Benchmark
 
