@@ -214,7 +214,7 @@ fn explainSafetyError(err: anyerror) []const u8 {
         error.ConflictingCommit =>
         \\-- CONFLICTING COMMIT ----------------------------------------------------------
         \\
-        \\A committed value conflicts with accepted or committed state.
+        \\One slot observed two different committed values.
         \\Hint: Treat this as a safety incident; stop and retain all evidence.
         ,
         else => unreachable,

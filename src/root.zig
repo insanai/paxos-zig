@@ -2,7 +2,9 @@
 //!
 //! The library performs no I/O and owns no threads or clocks. A `Node` consumes
 //! messages and emits `Effects`. Persist `Effects.writes` before transmitting
-//! `Effects.messages`; this ordering is part of the safety contract.
+//! `Effects.messages`; this ordering is part of the safety contract. After
+//! syncing a batch, call `Effects.confirmWritesDurable`; debug builds assert
+//! the ordering and panic on hosts that send before persisting.
 
 const protocol = @import("protocol.zig");
 const replicated_log = @import("replicated_log.zig");

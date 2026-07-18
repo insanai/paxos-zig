@@ -83,10 +83,11 @@ fn consumeEffects(
     counters: *[3]i64,
     queue: *[1024]P.Envelope,
     queue_count: *usize,
-    effects: *const P.Effects,
+    effects: *P.Effects,
 ) !void {
     // The safety contract is visible here: durable writes happen before sends.
     for (effects.writesSlice()) |write| try disks[node_index].apply(write);
+    effects.confirmWritesDurable();
 
     for (effects.messagesSlice()) |message| {
         if (queue_count.* == queue.len) return error.QueueFull;

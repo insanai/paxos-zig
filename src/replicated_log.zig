@@ -367,7 +367,9 @@ test "a decided stop sign seals a configuration" {
     var effects = Log.Effects{};
 
     _ = try node.append(41, &effects);
+    effects.confirmWritesDurable();
     _ = try node.reconfigure(8, &.{ 1, 2, 3 }, "snapshot:19", &effects);
+    effects.confirmWritesDurable();
     const stop = node.isReconfigured().?;
     try std.testing.expectEqual(@as(u64, 8), stop.configuration_id);
     try std.testing.expectEqualStrings("snapshot:19", stop.metadataSlice());
@@ -436,6 +438,7 @@ test "restore remains sealed after accepting a stop sign" {
     _ = try leader.reconfigure(5, &.{ 1, 2, 3 }, "next", &effects);
     var durable = Log.DurableState{};
     for (effects.writesSlice()) |write| try durable.apply(write);
+    effects.confirmWritesDurable();
 
     var restored: Log.Node = undefined;
     try restored.restore(1, 4, &membership, &durable);
@@ -461,6 +464,7 @@ test "restore does not remain sealed if proposed stop sign was overwritten" {
     _ = try leader.reconfigure(5, &.{ 1, 2, 3 }, "next", &effects);
     var durable = Log.DurableState{};
     for (effects.writesSlice()) |write| try durable.apply(write);
+    effects.confirmWritesDurable();
 
     // 2. Overwrite slot 1 with an accept of a normal command at a higher ballot
     const overwrite_accept = Log.Write{

@@ -22,6 +22,8 @@ pub const Options = struct {
     heartbeat_interval_ticks: u32 = 3,
     /// Leader ticks between bounded retransmission scans.
     resend_interval_ticks: u32 = 10,
+    /// Debug-build check that hosts confirm durability before reading messages.
+    assert_effect_order: bool = true,
 };
 
 /// A totally ordered, globally unique proposal attempt.
@@ -232,12 +234,14 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             messages_count: usize = 0,
             committed: [options.max_slots]Committed = undefined,
             committed_count: usize = 0,
+            writes_confirmed: bool = true,
 
             /// Initializes only active counts, leaving large backing arrays untouched.
             pub fn init(self: *Effects) void {
                 self.writes_count = 0;
                 self.messages_count = 0;
                 self.committed_count = 0;
+                self.writes_confirmed = true;
             }
 
             /// Clears counts without touching fixed backing storage.
@@ -245,9 +249,15 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 std.debug.assert(self.writes_count <= self.writes.len);
                 std.debug.assert(self.messages_count <= self.messages.len);
                 std.debug.assert(self.committed_count <= self.committed.len);
+                if (options.assert_effect_order) {
+                    // A nonempty write batch was discarded without the host
+                    // confirming durability; replies for it may already be out.
+                    std.debug.assert(self.writes_count == 0 or self.writes_confirmed);
+                }
                 self.writes_count = 0;
                 self.messages_count = 0;
                 self.committed_count = 0;
+                self.writes_confirmed = true;
             }
 
             /// Durable records in required application order.
@@ -255,8 +265,18 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 return self.writes[0..self.writes_count];
             }
 
+            /// Records that the host made every pending write durable (fsync).
+            /// Call after persisting `writesSlice` and before `messagesSlice`.
+            pub fn confirmWritesDurable(self: *Effects) void {
+                self.writes_confirmed = true;
+            }
+
             /// Messages that may be sent only after all writes are synced.
+            /// Debug builds assert `confirmWritesDurable` ran for this batch.
             pub fn messagesSlice(self: *const Effects) []const Envelope {
+                if (options.assert_effect_order) {
+                    std.debug.assert(self.writes_count == 0 or self.writes_confirmed);
+                }
                 return self.messages[0..self.messages_count];
             }
 
@@ -269,6 +289,7 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 std.debug.assert(self.writes_count < self.writes.len);
                 self.writes[self.writes_count] = write;
                 self.writes_count += 1;
+                self.writes_confirmed = false;
                 std.debug.assert(self.writes_count <= self.writes.len);
             }
 
@@ -312,11 +333,6 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                                 return error.ConflictingValue;
                             }
                         }
-                        if (self.committed[index]) |committed| {
-                            if (!std.meta.eql(committed, accepted.value)) {
-                                return error.ConflictingCommit;
-                            }
-                        }
                         self.promised = accepted.ballot;
                         self.accepted[index] = .{
                             .ballot = accepted.ballot,
@@ -325,16 +341,13 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                     },
                     .commit => |committed| {
                         const index = try slotIndex(committed.slot);
-                        if (self.accepted[index]) |accepted| {
-                            if (!std.meta.eql(accepted.value, committed.value)) {
-                                return error.ConflictingCommit;
-                            }
-                        }
                         if (self.committed[index]) |value| {
                             if (!std.meta.eql(value, committed.value)) {
                                 return error.ConflictingCommit;
                             }
                         }
+                        // A vote for another value may coexist with the
+                        // commit; see `recordCommit` for why that is legal.
                         self.committed[index] = committed.value;
                     },
                 }
@@ -343,12 +356,9 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
 
             fn assertValid(self: *const DurableState) void {
                 if (!std.debug.runtime_safety) return;
-                for (self.accepted, self.committed) |accepted, committed| {
+                for (self.accepted) |accepted| {
                     if (accepted) |value| {
                         std.debug.assert(!self.promised.lessThan(value.ballot));
-                        if (committed) |chosen| {
-                            std.debug.assert(std.meta.eql(value.value, chosen));
-                        }
                     }
                 }
             }
@@ -651,6 +661,8 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 self.durable.assertValid();
             }
 
+            /// Lamport step 1: choose a ballot above every ballot seen,
+            /// owned by this node, and broadcast NextBallot (prepare).
             fn startCampaign(self: *Node, noop: Value, effects: *Effects) !void {
                 const greatest_round = @max(
                     @max(self.ballot.round, self.durable.promised.round),
@@ -685,6 +697,10 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 if (!self.ballot.eql(ballot)) self.role = .follower;
             }
 
+            /// Lamport step 2: promise a ballot not below the current one
+            /// and reply with LastVote information for every slot above
+            /// the proposer's decided prefix, including decrees learned
+            /// without voting (paper section 3.1) as zero-ballot votes.
             fn onPrepare(
                 self: *Node,
                 from: NodeId,
@@ -709,7 +725,20 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 while (slot <= options.max_slots) {
                     std.debug.assert(slot > 0);
                     const index = @as(usize, slot - 1);
-                    if (self.durable.accepted[index]) |value| {
+                    // Report this slot's vote. A decree that was learned
+                    // without voting still travels as a zero-ballot vote:
+                    // the paper's parliamentary protocol has legislators
+                    // return already-passed decrees with their LastVote
+                    // reply so a president behind on the log recovers them.
+                    // A zero ballot loses to every real vote, so it can
+                    // never override the choosing quorum's value.
+                    var known = self.durable.accepted[index];
+                    if (known == null) {
+                        if (self.durable.committed[index]) |value| {
+                            known = .{ .ballot = Ballot.zero, .value = value };
+                        }
+                    }
+                    if (known) |value| {
                         accepted_count += 1;
                         effects.addMessage(.{
                             .from = self.id,
@@ -735,6 +764,8 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 });
             }
 
+            /// Lamport step 3 (collection): keep the highest-ballot vote
+            /// per slot across the promise quorum, as condition B3 needs.
             fn onPromise(
                 self: *Node,
                 from: NodeId,
@@ -776,6 +807,9 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 try self.maybeBecomeLeader(effects);
             }
 
+            /// Lamport step 3 (proposal): with complete promises from a
+            /// read quorum, re-drive recovered values, fill gaps with the
+            /// no-op decree, and release this node's own decided prefix.
             fn maybeBecomeLeader(self: *Node, effects: *Effects) !void {
                 var complete: usize = 0;
                 for (0..self.membership.count) |member| {
@@ -811,8 +845,14 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                     slot = slotAfter(slot);
                 }
                 self.next_slot = slotAfter(highest);
+                // A leader restored from its journal re-releases its own
+                // contiguous committed prefix; peers hear the re-broadcast
+                // commits above, but nobody sends commits to the leader.
+                self.emitContiguous(effects);
             }
 
+            /// Lamport step 4: vote unless the ballot is below the promise;
+            /// the vote is durable before the reply may be sent.
             fn onAccept(
                 self: *Node,
                 from: NodeId,
@@ -865,6 +905,8 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 });
             }
 
+            /// Lamport step 5: a write quorum of votes for this ballot
+            /// passes the decree.
             fn onAccepted(
                 self: *Node,
                 from: NodeId,
@@ -891,6 +933,7 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 } });
             }
 
+            /// Lamport step 6: write the passed decree in the ledger.
             fn onCommit(
                 self: *Node,
                 from: NodeId,
@@ -914,18 +957,32 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 }
                 if (!message.ballot.eql(self.durable.promised)) return;
                 self.observeLeader(from, message.ballot);
+                // A restarted follower re-learns silently: the heartbeat
+                // advertises the leader's decided prefix, and the learn reply
+                // also corrects the leader's stale view of this follower.
+                if (message.decided_through > self.delivered_through) {
+                    self.sendTo(from, effects, .{ .learn = .{
+                        .from_slot = self.delivered_through + 1,
+                    } });
+                }
             }
 
             fn recordCommit(self: *Node, slot: Slot, value: Value, effects: *Effects) !void {
                 const index = try slotIndex(slot);
                 if (self.durable.committed[index]) |committed| {
                     if (!std.meta.eql(committed, value)) return error.ConflictingCommit;
+                    // A duplicate commit still releases the contiguous
+                    // prefix: after a restart the replayed log is committed
+                    // but undelivered, and this is where delivery resumes.
+                    self.emitContiguous(effects);
                     return;
                 }
-                if (self.durable.accepted[index]) |accepted| {
-                    if (!std.meta.eql(accepted.value, value)) return error.ConflictingCommit;
-                }
-
+                // A differing accepted entry is legal: this node may hold a
+                // stale vote from a ballot that never won while a quorum it
+                // was not part of chose another value. The commit is
+                // authoritative; the stale vote stays and stays harmless
+                // because every read quorum intersects the choosing write
+                // quorum, whose higher-ballot votes carry the chosen value.
                 self.durable.committed[index] = value;
                 effects.addWrite(.{ .commit = .{
                     .slot = slot,
@@ -1252,6 +1309,7 @@ fn drainQueue(
         };
         try nodes[node_index].step(envelope, &effects);
         for (effects.writesSlice()) |write| try durable[node_index].apply(write);
+        effects.confirmWritesDurable();
         appendMessages(queue, queue_count, &effects);
     }
 }
@@ -1276,12 +1334,14 @@ test "multi-paxos elects a leader and commits consecutive values" {
     const first = try nodes[0].propose(41, &effects);
     try std.testing.expectEqual(@as(Slot, 1), first);
     for (effects.writesSlice()) |write| try durable[0].apply(write);
+    effects.confirmWritesDurable();
     appendMessages(&queue, &queue_count, &effects);
     try drainQueue(&nodes, &durable, &queue, &queue_count);
 
     const second = try nodes[0].propose(42, &effects);
     try std.testing.expectEqual(@as(Slot, 2), second);
     for (effects.writesSlice()) |write| try durable[0].apply(write);
+    effects.confirmWritesDurable();
     appendMessages(&queue, &queue_count, &effects);
     try drainQueue(&nodes, &durable, &queue, &queue_count);
 
@@ -1308,6 +1368,7 @@ test "duplicate messages are idempotent" {
     };
     try node.step(prepare, &effects);
     try std.testing.expectEqual(@as(usize, 1), effects.writes_count);
+    effects.confirmWritesDurable();
     try node.step(prepare, &effects);
     try std.testing.expectEqual(@as(usize, 0), effects.writes_count);
 
@@ -1322,6 +1383,7 @@ test "duplicate messages are idempotent" {
     };
     try node.step(accept, &effects);
     try std.testing.expectEqual(@as(usize, 1), effects.writes_count);
+    effects.confirmWritesDurable();
     try node.step(accept, &effects);
     try std.testing.expectEqual(@as(usize, 0), effects.writes_count);
     try std.testing.expectEqual(@as(usize, 1), effects.messages_count);
@@ -1358,6 +1420,7 @@ test "phase one tolerates reordering and recovers the highest accepted value" {
             else => unreachable,
         };
         try nodes[index].step(prepare, &effects);
+        effects.confirmWritesDurable();
 
         // Deliver each completion marker before its entry to exercise a network
         // that does not preserve sender ordering.
@@ -1378,6 +1441,7 @@ test "phase one tolerates reordering and recovers the highest accepted value" {
     var saw_recovered_accept = false;
     for (replies[0..reply_count]) |reply| {
         try nodes[2].step(reply, &effects);
+        effects.confirmWritesDurable();
         for (effects.messagesSlice()) |outbound| {
             switch (outbound.message) {
                 .accept => |accept| {
@@ -1404,6 +1468,7 @@ test "bounded log reports exhaustion without reusing a slot" {
     var effects = P.Effects{};
 
     try std.testing.expectEqual(@as(Slot, 1), try node.propose(1, &effects));
+    effects.confirmWritesDurable();
     try std.testing.expectError(error.SlotLimitReached, node.propose(2, &effects));
 }
 
@@ -1477,24 +1542,31 @@ test "durable replay rejects conflicting values" {
     const ballot = Ballot{ .round = 1, .node = 1 };
     try durable.apply(.{ .accept = .{ .ballot = ballot, .slot = 1, .value = 7 } });
 
+    // Two different values in one ballot and slot is corruption.
     try std.testing.expectError(
         error.ConflictingValue,
         durable.apply(.{ .accept = .{ .ballot = ballot, .slot = 1, .value = 8 } }),
     );
+    // A commit that differs from a stale local vote is legal Paxos: the
+    // choosing quorum may not have included this node.
+    try durable.apply(.{ .commit = .{ .slot = 1, .value = 8 } });
+    // Two different committed values for one slot is corruption.
     try std.testing.expectError(
         error.ConflictingCommit,
-        durable.apply(.{ .commit = .{ .slot = 1, .value = 8 } }),
+        durable.apply(.{ .commit = .{ .slot = 1, .value = 7 } }),
     );
-    try durable.apply(.{ .commit = .{ .slot = 1, .value = 7 } });
+    // A later-ballot vote may land after the commit; replay accepts it.
+    try durable.apply(.{
+        .accept = .{
+            .ballot = .{ .round = 2, .node = 1 },
+            .slot = 1,
+            .value = 8,
+        },
+    });
+    // A promise below the recorded vote is regression.
     try std.testing.expectError(
-        error.ConflictingCommit,
-        durable.apply(.{
-            .accept = .{
-                .ballot = .{ .round = 2, .node = 1 },
-                .slot = 1,
-                .value = 8,
-            },
-        }),
+        error.PromiseRegression,
+        durable.apply(.{ .accept = .{ .ballot = ballot, .slot = 1, .value = 7 } }),
     );
 }
 
@@ -1507,8 +1579,10 @@ test "leader persists its local acceptance before remote acknowledgements" {
     leader.ballot = .{ .round = 1, .node = 1 };
     var effects = TestProtocol.Effects{};
     _ = try leader.propose(123, &effects);
+    effects.confirmWritesDurable();
 
     for ([_]NodeId{ 2, 3 }) |from| {
+        effects.confirmWritesDurable();
         try leader.step(.{
             .from = from,
             .to = 1,
@@ -1536,6 +1610,7 @@ test "learners release commits only as a contiguous prefix" {
         .message = .{ .commit = .{ .slot = 2, .value = 22 } },
     }, &effects);
     try std.testing.expectEqual(@as(usize, 0), effects.committed_count);
+    effects.confirmWritesDurable();
 
     try node.step(.{
         .from = 1,
@@ -1545,6 +1620,51 @@ test "learners release commits only as a contiguous prefix" {
     try std.testing.expectEqual(@as(usize, 2), effects.committed_count);
     try std.testing.expectEqual(@as(Slot, 1), effects.committed[0].slot);
     try std.testing.expectEqual(@as(Slot, 2), effects.committed[1].slot);
+}
+
+test "effects track durability confirmation for each write batch" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var node: TestProtocol.Node = undefined;
+    try node.init(2, &membership);
+    var effects = TestProtocol.Effects{};
+
+    try std.testing.expect(effects.writes_confirmed);
+    try node.step(.{
+        .from = 1,
+        .to = 2,
+        .message = .{ .prepare = .{
+            .ballot = .{ .round = 1, .node = 1 },
+            .decided_through = 0,
+        } },
+    }, &effects);
+    try std.testing.expect(effects.writes_count > 0);
+    try std.testing.expect(!effects.writes_confirmed);
+    effects.confirmWritesDurable();
+    try std.testing.expect(effects.writes_confirmed);
+    try std.testing.expect(effects.messagesSlice().len > 0);
+
+    // Hosts that opt out of the guard may read messages without confirming.
+    const Unchecked = Protocol(u64, .{
+        .max_members = 3,
+        .max_slots = 16,
+        .assert_effect_order = false,
+    });
+    var unchecked_membership: Unchecked.Membership = undefined;
+    try unchecked_membership.init(&.{ 1, 2, 3 });
+    var unchecked_node: Unchecked.Node = undefined;
+    try unchecked_node.init(2, &unchecked_membership);
+    var unchecked_effects = Unchecked.Effects{};
+    try unchecked_node.step(.{
+        .from = 1,
+        .to = 2,
+        .message = .{ .prepare = .{
+            .ballot = .{ .round = 1, .node = 1 },
+            .decided_through = 0,
+        } },
+    }, &unchecked_effects);
+    try std.testing.expect(unchecked_effects.writes_count > 0);
+    try std.testing.expect(unchecked_effects.messagesSlice().len > 0);
 }
 
 test "catch-up returns known commits from the requested slot" {
