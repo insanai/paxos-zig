@@ -25,11 +25,20 @@ latency:
   like with like, and read the durable-path numbers to see what the safety
   contract costs on a real filesystem.
 
+In-memory samples aggregate repeated, independently initialized
+stable-leader iterations before selecting the median of seven totals. Setup and
+post-run validation are outside the timed interval. The separate per-window
+percentiles are averages within a drained proposal window; they are not request
+latency percentiles.
+
 ## Recording protocol
 
 Run on AC power with the machine otherwise idle, close heavyweight
 applications, and prefer a machine without aggressive thermal throttling.
 Record at least the default seven samples per mode (three for the durable
 path) and commit the produced file unedited. The `meta` block captures the
-date, host, CPU, OS, git revision, and toolchain versions; results without
+date, host, CPU, OS, git revision, whether the working tree was modified, and
+toolchain versions. A dirty result is useful during development but is not an
+archival comparison point: after committing benchmark changes, rerun once more
+so the recorded revision contains the exact measured source. Results without
 that context are not comparable and should not be committed.
