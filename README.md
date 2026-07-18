@@ -19,7 +19,8 @@ intersection, and eventual selection of one leader for progress.
 ## Build
 
 ```sh
-zig build test
+zig build test       # unit tests + seeded fault simulation
+zig build sim -- --seeds=1000 --steps=1024   # longer simulation sweeps
 zig build run
 zig build benchmark
 zig build book
@@ -122,8 +123,15 @@ try node.campaign(noop_command, &effects);
 For every returned batch:
 
 1. Append and synchronize `effects.writesSlice()` to stable storage.
-2. Send `effects.messagesSlice()` to their recipients.
-3. Apply `effects.committedSlice()` in slot order to the state machine.
+2. Call `effects.confirmWritesDurable()` to record that the batch is durable.
+3. Send `effects.messagesSlice()` to their recipients.
+4. Apply `effects.committedSlice()` in slot order to the state machine.
+
+Debug builds assert this ordering: reading `messagesSlice()` while a write
+batch is unconfirmed panics, as does starting the next transition. Release
+builds compile the check away. Hosts with a transport that snapshots messages
+before the fsync completes can opt out with `.assert_effect_order = false`,
+taking responsibility for the ordering themselves.
 
 Call `node.step(envelope, &effects)` for network input. Once `node.role` is
 `.leader`, `node.propose(command, &effects)` assigns a slot. Proposals that time
@@ -173,20 +181,45 @@ The exact capability boundaries are in
 source conventions are explained in
 [the reviewable-code chapter](docs/book/04_style.typ).
 
+## Verification
+
+Beyond the unit tests, `zig build test` runs a deterministic, seed-driven
+fault simulator (`sim/simulation.zig`): random message loss, duplication,
+reordering, partitions, and crash-restart at every host commit point
+(including a crash after a durable prefix of writes with no message sent),
+with agreement, validity, monotonicity, and convergence oracles checked
+every step. Any failure prints its seed; replay it exactly with
+`zig build sim -- --seed=N --steps=M --verbose`.
+
+`specs/Paxos.tla` is a TLC-checked model of the same protocol at the
+durable-state level; `specs/README.md` documents the action-to-code
+mapping and how to run TLC. The book's conformance appendix maps Lamport's
+protocol steps to the code, the simulator's oracles, and the spec.
+
 ## Benchmark
 
-`zig build benchmark` compares the library's stable leader path with the pinned
-OmniPaxos 0.2.2 Rust package and LibPaxos3 C revision `d255f8b`. All programs use
-three in-memory voters, append 4,096 `u64` values, and report the median of seven
-samples. Zig and OmniPaxos use 6 logical messages per value. LibPaxos3 advances
-its phase-one preexecution window and uses 12, so its result is labeled rather
-than presented as an identical protocol path.
+`zig build benchmark` runs a workload matrix — commit modes (sync,
+pipelined, batched), payload sizes (8 B to 1 KiB), cluster sizes (3 and
+5), log-slack variants, and an fsync write-ahead durable path — for this
+library, the pinned OmniPaxos 0.2.2 Rust package, and LibPaxos3 C revision
+`d255f8b`. Every run reports median-of-seven totals with spread, a latency
+distribution, measured message counts, and a checksum, and exits nonzero
+on a self-check mismatch. `sh benchmarks/run-all.sh` writes the results
+plus environment metadata to `benchmarks/results/`; the book renders its
+numbers from that file only.
 
-The benchmark reports CPU time, messages, and a checksum. It does not make the
-three libraries feature-equivalent, and it does not measure real disk or network
-latency. Treat the CPU result as a local regression signal. The first run needs
-Rust, Cargo, Git, and network access for locked dependencies and pinned C source.
-Use `zig build benchmark-zig` or `zig build benchmark-libpaxos` for one side.
+Read the results as workload fixtures, not as a language comparison: the
+harness shape decides who looks fast. One-value-at-a-time favors this
+library's per-append overhead; pipelined windows let OmniPaxos coalesce
+log entries into far fewer messages, where it matches or beats this
+library's fixed six-messages-per-value path. LibPaxos3 runs a heavier
+measured twelve-message path including phase-one preexecution. None of the
+in-memory numbers are service latency or throughput — the durable-path
+benchmark shows the real cost of the safety contract on a filesystem. The
+first run needs Rust, Cargo, Git, and network access for locked
+dependencies and pinned C source. Use `zig build benchmark-zig`,
+`zig build benchmark-durable`, or `zig build benchmark-libpaxos` for one
+side.
 
 ## License
 
