@@ -10,7 +10,8 @@ pub fn build(b: *std.Build) void {
     });
 
     addExample(b, target, optimize, paxos);
-    addTests(b, paxos);
+    const test_step = addTests(b, paxos);
+    addSimulation(b, target, optimize, paxos, test_step);
     addApiDocs(b, paxos);
     addBenchmarks(b, target);
     addFormatting(b);
@@ -55,11 +56,62 @@ fn addExample(
     run_step.dependOn(&run_example.step);
 }
 
-fn addTests(b: *std.Build, paxos: *std.Build.Module) void {
+fn addTests(b: *std.Build, paxos: *std.Build.Module) *std.Build.Step {
     const tests = b.addTest(.{ .root_module = paxos });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the protocol test suite");
     test_step.dependOn(&run_tests.step);
+    return test_step;
+}
+
+fn addSimulation(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    paxos: *std.Build.Module,
+    test_step: *std.Build.Step,
+) void {
+    const sim_options = b.addOptions();
+    sim_options.addOption(
+        u64,
+        "seeds",
+        b.option(u64, "sim-seeds", "Simulation seeds per configuration") orelse 64,
+    );
+    sim_options.addOption(
+        u32,
+        "steps",
+        b.option(u32, "sim-steps", "Simulation steps per seed") orelse 512,
+    );
+
+    const sim_module = b.createModule(.{
+        .root_source_file = b.path("sim/simulation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "paxos", .module = paxos },
+            .{ .name = "sim_options", .module = sim_options.createModule() },
+        },
+    });
+    const sim_tests = b.addTest(.{ .root_module = sim_module });
+    const run_sim_tests = b.addRunArtifact(sim_tests);
+    test_step.dependOn(&run_sim_tests.step);
+
+    const sim_exe = b.addExecutable(.{
+        .name = "paxos-sim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sim/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "paxos", .module = paxos },
+                .{ .name = "sim_options", .module = sim_options.createModule() },
+            },
+        }),
+    });
+    const run_sim = b.addRunArtifact(sim_exe);
+    if (b.args) |args| run_sim.addArgs(args);
+    const sim_step = b.step("sim", "Run the deterministic protocol simulator");
+    sim_step.dependOn(&run_sim.step);
 }
 
 fn addBenchmarks(b: *std.Build, target: std.Build.ResolvedTarget) void {
@@ -80,6 +132,22 @@ fn addBenchmarks(b: *std.Build, target: std.Build.ResolvedTarget) void {
     const run_benchmark = b.addRunArtifact(benchmark);
     const zig_step = b.step("benchmark-zig", "Run the Zig in-memory benchmark");
     zig_step.dependOn(&run_benchmark.step);
+
+    const durable = b.addExecutable(.{
+        .name = "paxos-benchmark-durable",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/durable.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "paxos", .module = benchmark_paxos }},
+        }),
+    });
+    const run_durable = b.addRunArtifact(durable);
+    const durable_step = b.step(
+        "benchmark-durable",
+        "Run the fsync write-ahead journal benchmark",
+    );
+    durable_step.dependOn(&run_durable.step);
 
     const rust_benchmark = b.addSystemCommand(&.{
         "cargo", "run", "--release", "--locked", "--manifest-path",
@@ -103,11 +171,12 @@ fn addBenchmarks(b: *std.Build, target: std.Build.ResolvedTarget) void {
         "Compare Zig with Rust OmniPaxos and C LibPaxos3",
     );
     benchmark_step.dependOn(&aggregate_libpaxos.step);
+    benchmark_step.dependOn(&run_durable.step);
 }
 
 fn addFormatting(b: *std.Build) void {
     const fmt = b.addFmt(.{
-        .paths = &.{ "build.zig", "src", "examples", "benchmarks" },
+        .paths = &.{ "build.zig", "src", "examples", "benchmarks", "sim" },
         .check = true,
     });
     const style = b.addSystemCommand(&.{ "sh", "tools/check-style.sh" });
@@ -117,7 +186,8 @@ fn addFormatting(b: *std.Build) void {
 }
 
 fn addBook(b: *std.Build) void {
-    const book = b.addSystemCommand(&.{ "typst", "compile" });
+    // --root exposes benchmarks/results/ to the book's generated tables.
+    const book = b.addSystemCommand(&.{ "typst", "compile", "--root", "." });
     book.addFileArg(b.path("docs/book.typ"));
     book.addArg("docs/part-time-parliament.pdf");
     const book_step = b.step("book", "Build the Part Time Parliament book");

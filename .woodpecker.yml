@@ -5,9 +5,26 @@ steps:
       - zig build fmt
       - zig build test
       - zig build run
+      # Correctness smoke: the benchmark self-checks message counts and
+      # checksums and exits nonzero on mismatch. Never gate on its timing.
       - zig build benchmark-zig
+      - zig build benchmark-durable
+
+  libpaxos-benchmark:
+    image: ghcr.io/ziglang/zig:0.16.0
+    commands:
+      - apt-get update && apt-get install -y git ca-certificates
+      - zig build benchmark-libpaxos
 
   rust-benchmark:
     image: rust:1.95
     commands:
       - cargo run --release --locked --manifest-path benchmarks/omnipaxos-rust/Cargo.toml
+
+  sim-nightly:
+    image: ghcr.io/ziglang/zig:0.16.0
+    commands:
+      - zig build sim -- --seeds=10000 --steps=4096
+      - zig build sim -- --seeds=2000 --steps=4096 --nodes=5
+    when:
+      - event: cron
