@@ -202,18 +202,21 @@ protocol steps to the code, the simulator's oracles, and the spec.
 pipelined, batched), payload sizes (8 B to 1 KiB), cluster sizes (3 and
 5), log-slack variants, and an fsync write-ahead durable path — for this
 library, the pinned OmniPaxos 0.2.2 Rust package, and LibPaxos3 C revision
-`d255f8b`. Every run reports median-of-seven totals with spread, a latency
-distribution, measured message counts, and a checksum, and exits nonzero
-on a self-check mismatch. `sh benchmarks/run-all.sh` writes the results
-plus environment metadata to `benchmarks/results/`; the book renders its
-numbers from that file only.
+`d255f8b`. Each in-memory sample aggregates repeated stable-leader iterations
+before taking a median of seven. The Zig and OmniPaxos fixtures validate every
+replica; Zig also validates its separate durable mirrors. LibPaxos3 validates
+all accept replies and its learner. Every fixture checks its checksum and
+logical envelope count; the durable fixture also reopens and replays every
+journal. `sh benchmarks/run-all.sh` writes results plus
+environment and dirty-tree metadata to `benchmarks/results/`; the book renders
+its numbers from that file only.
 
 Read the results as workload fixtures, not as a language comparison: the
-harness shape decides who looks fast. One-value-at-a-time favors this
-library's per-append overhead; pipelined windows let OmniPaxos coalesce
-log entries into far fewer messages, where it matches or beats this
-library's fixed six-messages-per-value path. LibPaxos3 runs a heavier
-measured twelve-message path including phase-one preexecution. None of the
+harness shape decides who looks fast. One-value-at-a-time exposes this
+library's low per-append overhead; pipelined windows let OmniPaxos coalesce
+log entries into far fewer envelopes and narrow the gap substantially, while
+this library keeps a fixed six one-value envelopes per value. LibPaxos3 runs a
+heavier measured twelve-envelope path including phase-one preexecution. None of the
 in-memory numbers are service latency or throughput — the durable-path
 benchmark shows the real cost of the safety contract on a filesystem. The
 first run needs Rust, Cargo, Git, and network access for locked
