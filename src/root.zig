@@ -21,9 +21,12 @@ pub const Protocol = protocol.Protocol;
 pub const ReplicatedLogOptions = replicated_log.Options;
 /// Reconfigurable command log with stop signs and snapshot epochs.
 pub const ReplicatedLog = replicated_log.ReplicatedLog;
+/// Returns a human-friendly Elm-style explanation of any error.
+pub const explainError = @import("errors.zig").explainError;
 
 test {
     _ = @import("bit_set.zig");
     _ = @import("protocol.zig");
     _ = @import("replicated_log.zig");
+    _ = @import("errors.zig");
 }
