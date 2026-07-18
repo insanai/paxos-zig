@@ -13,6 +13,11 @@ out_dir="benchmarks/results"
 out_file="$out_dir/$stamp-$host.json"
 mkdir -p "$out_dir"
 
+dirty=false
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    dirty=true
+fi
+
 capture() {
     # Benchmarks print human blocks and JSON lines on stderr/stdout; keep
     # only the JSON lines.
@@ -60,6 +65,7 @@ fi
     printf '"cpu":"%s",' "$cpu"
     printf '"os":"%s",' "$(uname -sr)"
     printf '"git":"%s",' "$(git rev-parse --short HEAD 2>/dev/null || echo none)"
+    printf '"dirty":%s,' "$dirty"
     printf '"zig":"%s",' "$(zig version)"
     printf '"rustc":"%s"' "$(rustc --version | cut -d' ' -f2)"
     printf '},"runs":[\n'

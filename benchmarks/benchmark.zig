@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var failures: u32 = 0;
 
-    const U64x3 = Bench(u64, 3, 4_096, 4_096);
+    const U64x3 = Bench(u64, 3, 4_096, 4_096, 32);
     failures += try U64x3.runAll(io, "u64-3n", &.{
         sync_mode,
         .{ .name = "pipeline8", .window = 8 },
@@ -41,22 +41,22 @@ pub fn main(init: std.process.Init) !void {
 
     // Twice the slots the workload needs: quantifies how much of the result
     // depends on arrays sized exactly to the value count.
-    const U64Slack = Bench(u64, 3, 4_096, 8_192);
+    const U64Slack = Bench(u64, 3, 4_096, 8_192, 32);
     failures += try U64Slack.runAll(io, "u64-3n-slack", &.{sync_mode});
 
-    const Blob64x3 = Bench(Blob(64), 3, 1_024, 1_024);
+    const Blob64x3 = Bench(Blob(64), 3, 1_024, 1_024, 64);
     failures += try Blob64x3.runAll(io, "blob64-3n", &.{
         sync_mode,
         .{ .name = "pipeline8", .window = 8 },
     });
 
-    const Blob1kx3 = Bench(Blob(1_024), 3, 1_024, 1_024);
+    const Blob1kx3 = Bench(Blob(1_024), 3, 1_024, 1_024, 16);
     failures += try Blob1kx3.runAll(io, "blob1k-3n", &.{
         sync_mode,
         .{ .name = "pipeline8", .window = 8 },
     });
 
-    const U64x5 = Bench(u64, 5, 4_096, 4_096);
+    const U64x5 = Bench(u64, 5, 4_096, 4_096, 16);
     failures += try U64x5.runAll(io, "u64-5n", &.{
         sync_mode,
         .{ .name = "pipeline8", .window = 8 },
@@ -89,6 +89,7 @@ fn Bench(
     comptime node_count: comptime_int,
     comptime value_count: u64,
     comptime max_slots: usize,
+    comptime measurement_iterations: u64,
 ) type {
     const P = paxos.Protocol(ValueT, .{
         .max_members = node_count,
@@ -129,20 +130,22 @@ fn Bench(
 
         fn runMode(io: std.Io, workload: []const u8, mode: Mode) !u32 {
             // Total-time samples run without per-window clock reads; one
-            // extra instrumented pass collects the latency distribution so
-            // timer overhead never contaminates the throughput numbers.
+            // extra instrumented pass collects window-average timing so
+            // timer overhead never contaminates the aggregate samples.
             var samples: [sample_count]Sample = undefined;
-            for (&samples) |*sample| sample.* = try runSample(io, mode, false);
+            for (&samples) |*sample| sample.* = try runMeasurement(io, mode);
             sortSamples(&samples);
             const median = samples[sample_count / 2];
 
             _ = try runSample(io, mode, true);
-            var percentiles: [4]u64 = .{ 0, 0, 0, 0 };
-            computePercentiles(&percentiles);
-            report(workload, mode, &samples, median, percentiles);
+            var window_ns_per_value: [4]u64 = .{ 0, 0, 0, 0 };
+            computePercentiles(&window_ns_per_value);
+            report(workload, mode, &samples, median, window_ns_per_value);
 
-            const expected_checksum = value_count * (value_count + 1) / 2;
-            const expected_messages = expected_messages_per_value * value_count;
+            const expected_checksum = value_count * (value_count + 1) / 2 *
+                measurement_iterations;
+            const expected_messages = expected_messages_per_value * value_count *
+                measurement_iterations;
             if (median.checksum != expected_checksum or
                 median.messages != expected_messages)
             {
@@ -152,6 +155,20 @@ fn Bench(
                 return 1;
             }
             return 0;
+        }
+
+        /// Aggregates enough independently initialized stable-leader runs to
+        /// keep sub-millisecond fixtures from becoming clock-noise contests.
+        /// Initialization and validation remain outside each timed interval.
+        fn runMeasurement(io: std.Io, mode: Mode) !Sample {
+            var result = Sample{ .checksum = 0, .messages = 0, .nanoseconds = 0 };
+            for (0..measurement_iterations) |_| {
+                const sample = try runSample(io, mode, false);
+                result.checksum +%= sample.checksum;
+                result.messages += sample.messages;
+                result.nanoseconds += sample.nanoseconds;
+            }
+            return result;
         }
 
         fn runSample(io: std.Io, mode: Mode, instrumented: bool) !Sample {
@@ -194,6 +211,18 @@ fn Bench(
             var checksum: u64 = 0;
             for (1..value_count + 1) |slot| {
                 checksum +%= sequenceOf(s.nodes[0].committedAt(@intCast(slot)).?);
+            }
+            for (0..node_count) |node_index| {
+                var replica_checksum: u64 = 0;
+                for (1..value_count + 1) |slot| {
+                    const value = s.nodes[node_index].committedAt(@intCast(slot)) orelse
+                        return error.IncompleteReplica;
+                    replica_checksum +%= sequenceOf(value);
+                }
+                if (replica_checksum != checksum) return error.ReplicaDivergence;
+                if (!std.meta.eql(s.nodes[node_index].durable, s.disks[node_index])) {
+                    return error.DurableMirrorMismatch;
+                }
             }
             std.mem.doNotOptimizeAway(checksum);
             return .{
@@ -271,49 +300,55 @@ fn Bench(
             mode: Mode,
             samples: *const [sample_count]Sample,
             median: Sample,
-            percentiles: [4]u64,
+            window_ns_per_value: [4]u64,
         ) void {
+            const measured_values = value_count * measurement_iterations;
             const per_value = @as(f64, @floatFromInt(median.nanoseconds)) /
-                @as(f64, @floatFromInt(value_count));
+                @as(f64, @floatFromInt(measured_values));
             std.debug.print(
                 \\workload:       {s} mode={s} (Zig Multi-Paxos 0.1.0)
-                \\values:         {d} nodes={d} payload={d}B max_slots={d}
+                \\values:         {d} ({d} x {d} iterations) nodes={d} payload={d}B max_slots={d}
                 \\median_ns:      {d} (min {d}, max {d} across {d} samples)
                 \\ns_per_value:   {d:.2}
-                \\per-value ns in window p50/p90/p99/max: {d}/{d}/{d}/{d}
+                \\window-average ns/value p50/p90/p99/max: {d}/{d}/{d}/{d}
                 \\messages:       {d}
                 \\messages/value: {d:.2}
                 \\checksum:       {d}
                 \\
             , .{
                 workload,                              mode.name,
-                value_count,                           node_count,
+                measured_values,                       value_count,
+                measurement_iterations,                node_count,
                 @sizeOf(ValueT),                       max_slots,
                 median.nanoseconds,                    samples[0].nanoseconds,
                 samples[sample_count - 1].nanoseconds, sample_count,
-                per_value,                             percentiles[0],
-                percentiles[1],                        percentiles[2],
-                percentiles[3],                        median.messages,
+                per_value,                             window_ns_per_value[0],
+                window_ns_per_value[1],                window_ns_per_value[2],
+                window_ns_per_value[3],                median.messages,
                 @as(f64, @floatFromInt(median.messages)) /
-                    @as(f64, @floatFromInt(value_count)),
+                    @as(f64, @floatFromInt(measured_values)),
                 median.checksum,
             });
             std.debug.print(
                 "{{\"impl\":\"paxos-zig\",\"workload\":\"{s}\",\"mode\":\"{s}\"," ++
                     "\"values\":{d},\"nodes\":{d},\"payload_bytes\":{d}," ++
+                    "\"values_per_iteration\":{d},\"measurement_iterations\":{d}," ++
                     "\"max_slots\":{d},\"ns_total_median\":{d}," ++
                     "\"ns_total_min\":{d},\"ns_total_max\":{d}," ++
-                    "\"ns_per_value\":{d:.2},\"lat_p50_ns\":{d}," ++
-                    "\"lat_p90_ns\":{d},\"lat_p99_ns\":{d},\"lat_max_ns\":{d}," ++
+                    "\"ns_per_value\":{d:.2},\"window_ns_per_value_p50\":{d}," ++
+                    "\"window_ns_per_value_p90\":{d}," ++
+                    "\"window_ns_per_value_p99\":{d}," ++
+                    "\"window_ns_per_value_max\":{d}," ++
                     "\"messages\":{d},\"checksum\":{d}}}\n\n",
                 .{
                     workload,                              mode.name,
-                    value_count,                           node_count,
-                    @sizeOf(ValueT),                       max_slots,
+                    measured_values,                       node_count,
+                    @sizeOf(ValueT),                       value_count,
+                    measurement_iterations,                max_slots,
                     median.nanoseconds,                    samples[0].nanoseconds,
                     samples[sample_count - 1].nanoseconds, per_value,
-                    percentiles[0],                        percentiles[1],
-                    percentiles[2],                        percentiles[3],
+                    window_ns_per_value[0],                window_ns_per_value[1],
+                    window_ns_per_value[2],                window_ns_per_value[3],
                     median.messages,                       median.checksum,
                 },
             );

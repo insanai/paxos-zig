@@ -34,6 +34,7 @@ const State = struct {
     effects: P.Effects,
     files: [node_count]std.Io.File,
     offsets: [node_count]u64,
+    dirty: [node_count]bool,
     fsyncs: u64,
     queue: [4_096]P.Envelope,
     queue_count: usize,
@@ -78,30 +79,36 @@ fn runMode(io: std.Io, name: []const u8, window: u32) !void {
         \\workload:       durable-u64-3n mode={s} (Zig Multi-Paxos 0.1.0)
         \\values:         {d} nodes={d} journal=file-per-node fsync-before-send
         \\median_ns:      {d}
+        \\range_ns:       {d}..{d} across {d} samples
         \\ns_per_value:   {d:.2}
         \\fsyncs:         {d}
         \\checksum:       {d}
         \\
     , .{
-        name,            value_count,
-        node_count,      median.nanoseconds,
-        per_value,       median.fsyncs,
-        median.checksum,
+        name,                   value_count,
+        node_count,             median.nanoseconds,
+        samples[0].nanoseconds, samples[sample_count - 1].nanoseconds,
+        sample_count,           per_value,
+        median.fsyncs,          median.checksum,
     });
     std.debug.print(
         "{{\"impl\":\"paxos-zig\",\"workload\":\"durable-u64-3n\"," ++
             "\"mode\":\"{s}\",\"values\":{d},\"nodes\":{d}," ++
             "\"payload_bytes\":8,\"ns_total_median\":{d}," ++
+            "\"ns_total_min\":{d},\"ns_total_max\":{d}," ++
             "\"ns_per_value\":{d:.2},\"fsyncs\":{d},\"checksum\":{d}}}\n\n",
         .{
-            name,            value_count,
-            node_count,      median.nanoseconds,
-            per_value,       median.fsyncs,
+            name,                   value_count,
+            node_count,             median.nanoseconds,
+            samples[0].nanoseconds, samples[sample_count - 1].nanoseconds,
+            per_value,              median.fsyncs,
             median.checksum,
         },
     );
     const expected = value_count * (value_count + 1) / 2;
-    if (median.checksum != expected) {
+    const groups = (value_count + window - 1) / window;
+    const expected_fsyncs = groups * 6;
+    if (median.checksum != expected or median.fsyncs != expected_fsyncs) {
         std.debug.print("SELF-CHECK FAILED for durable/{s}\n", .{name});
         std.process.exit(1);
     }
@@ -123,6 +130,9 @@ fn runSample(io: std.Io, window: u32, sample_index: usize) !Sample {
     try settle(io, 0);
     try drain(io);
     std.debug.assert(s.nodes[0].role == .leader);
+    // Election setup is outside the timed workload and therefore outside its
+    // fsync accounting as well.
+    s.fsyncs = 0;
 
     const started = std.Io.Clock.Timestamp.now(io, .awake);
     var seq: u64 = 1;
@@ -142,7 +152,16 @@ fn runSample(io: std.Io, window: u32, sample_index: usize) !Sample {
     for (1..value_count + 1) |slot| {
         checksum +%= s.nodes[0].committedAt(@intCast(slot)).?;
     }
+    for (1..node_count) |node_index| {
+        var replica_checksum: u64 = 0;
+        for (1..value_count + 1) |slot| {
+            replica_checksum +%= s.nodes[node_index].committedAt(@intCast(slot)) orelse
+                return error.IncompleteReplica;
+        }
+        if (replica_checksum != checksum) return error.ReplicaDivergence;
+    }
     closeJournals(io);
+    try verifyJournals(io, sample_index);
     return .{
         .nanoseconds = @intCast(started.durationTo(finished).raw.nanoseconds),
         .fsyncs = s.fsyncs,
@@ -163,6 +182,7 @@ fn openJournals(io: std.Io, sample_index: usize) !void {
             .truncate = true,
         });
         s.offsets[index] = 0;
+        s.dirty[index] = false;
     }
 }
 
@@ -193,8 +213,11 @@ fn buffer(io: std.Io, node_index: usize) !void {
 
 fn flushNode(io: std.Io, node_index: usize) !void {
     const s = &state;
-    try s.files[node_index].sync(io);
-    s.fsyncs += 1;
+    if (s.dirty[node_index]) {
+        try s.files[node_index].sync(io);
+        s.fsyncs += 1;
+        s.dirty[node_index] = false;
+    }
     for (s.pending[node_index][0..s.pending_count[node_index]]) |message| {
         enqueue(&s.queue, &s.queue_count, message);
     }
@@ -203,8 +226,10 @@ fn flushNode(io: std.Io, node_index: usize) !void {
 
 fn persist(io: std.Io, node_index: usize) !void {
     try append(io, node_index);
+    if (!state.dirty[node_index]) return;
     try state.files[node_index].sync(io);
     state.fsyncs += 1;
+    state.dirty[node_index] = false;
 }
 
 fn append(io: std.Io, node_index: usize) !void {
@@ -221,6 +246,40 @@ fn append(io: std.Io, node_index: usize) !void {
         s.offsets[node_index],
     );
     s.offsets[node_index] += length;
+    s.dirty[node_index] = true;
+}
+
+/// Reopens every journal and proves that the measured bytes reconstruct the
+/// same durable state as the live node. Recovery is outside the timed region.
+fn verifyJournals(io: std.Io, sample_index: usize) !void {
+    const s = &state;
+    inline for (0..node_count) |index| {
+        var name_buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(
+            &name_buffer,
+            bench_dir ++ "/node{d}-sample{d}.journal",
+            .{ index + 1, sample_index },
+        );
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+
+        var replayed = P.DurableState{};
+        var offset: u64 = 0;
+        var bytes: [record_size]u8 = undefined;
+        while (offset < s.offsets[index]) : (offset += record_size) {
+            const read = try file.readPositionalAll(io, &bytes, offset);
+            if (read != record_size) return error.TruncatedJournalRecord;
+            try replayed.apply(try decode(&bytes));
+        }
+        if (offset != s.offsets[index]) return error.MisalignedJournal;
+        var trailing: [1]u8 = undefined;
+        if (try file.readPositionalAll(io, &trailing, offset) != 0) {
+            return error.TrailingJournalData;
+        }
+        if (!std.meta.eql(replayed, s.nodes[index].durable)) {
+            return error.JournalReplayMismatch;
+        }
+    }
 }
 
 /// Fixed 33-byte little-endian record: tag, ballot, slot, value.
@@ -253,6 +312,25 @@ fn encode(write: P.Write, out: []u8) void {
     std.mem.writeInt(u32, out[17..21], slot, .little);
     std.mem.writeInt(u64, out[21..29], value, .little);
     std.mem.writeInt(u32, out[29..33], 0, .little);
+}
+
+fn decode(bytes: *const [record_size]u8) !P.Write {
+    if (std.mem.readInt(u32, bytes[29..33], .little) != 0) {
+        return error.InvalidJournalRecord;
+    }
+    const ballot = paxos.Ballot{
+        .round = std.mem.readInt(u64, bytes[1..9], .little),
+        .priority = std.mem.readInt(u32, bytes[9..13], .little),
+        .node = std.mem.readInt(u32, bytes[13..17], .little),
+    };
+    const slot = std.mem.readInt(u32, bytes[17..21], .little);
+    const value = std.mem.readInt(u64, bytes[21..29], .little);
+    return switch (bytes[0]) {
+        1 => .{ .promise = ballot },
+        2 => .{ .accept = .{ .ballot = ballot, .slot = slot, .value = value } },
+        3 => .{ .commit = .{ .slot = slot, .value = value } },
+        else => error.InvalidJournalRecord,
+    };
 }
 
 fn enqueue(queue: []P.Envelope, count: *usize, message: P.Envelope) void {

@@ -13,6 +13,7 @@ enum {
     node_count = 3,
     value_count = 4096,
     sample_count = 7,
+    measurement_iterations = 32,
     preexecution_window = 128,
 };
 
@@ -119,6 +120,18 @@ static struct sample run_sample(void)
     };
 }
 
+static struct sample run_measurement(void)
+{
+    struct sample result = {0};
+    for (int iteration = 0; iteration < measurement_iterations; iteration++) {
+        const struct sample sample = run_sample();
+        result.checksum += sample.checksum;
+        result.messages += sample.messages;
+        result.nanoseconds += sample.nanoseconds;
+    }
+    return result;
+}
+
 static int compare_samples(const void *left, const void *right)
 {
     const struct sample *a = left;
@@ -135,30 +148,41 @@ int main(void)
     paxos_config.verbosity = PAXOS_LOG_ERROR;
     struct sample samples[sample_count];
     for (int index = 0; index < sample_count; index++)
-        samples[index] = run_sample();
+        samples[index] = run_measurement();
     qsort(samples, sample_count, sizeof(samples[0]), compare_samples);
     const struct sample result = samples[sample_count / 2];
 
     printf("implementation: LibPaxos3 d255f8b (C)\n");
     printf("path:           per-value accept plus phase-one preexecution;\n");
     printf("                heavier than the 6-message stable-leader path\n");
-    printf("values:         %d\n", value_count);
+    const uint64_t measured_values = (uint64_t)value_count * measurement_iterations;
+    printf("values:         %" PRIu64 " (%d x %d iterations)\n",
+        measured_values, value_count, measurement_iterations);
     printf("median_ns:      %" PRIu64 "\n", result.nanoseconds);
-    printf("ns_per_value:   %.2f\n", (double)result.nanoseconds / value_count);
+    printf("range_ns:       %" PRIu64 "..%" PRIu64 " across %d samples\n",
+        samples[0].nanoseconds, samples[sample_count - 1].nanoseconds,
+        sample_count);
+    printf("ns_per_value:   %.2f\n", (double)result.nanoseconds / measured_values);
     printf("messages:       %" PRIu64 " (measured)\n", result.messages);
-    printf("messages/value: %.2f\n", (double)result.messages / value_count);
+    printf("messages/value: %.2f\n", (double)result.messages / measured_values);
     printf("checksum:       %" PRIu64 "\n", result.checksum);
     printf("{\"impl\":\"libpaxos3\",\"workload\":\"u64-3n\","
-           "\"mode\":\"sync-preexec\",\"values\":%d,\"nodes\":%d,"
-           "\"payload_bytes\":8,\"ns_total_median\":%" PRIu64 ","
+           "\"mode\":\"sync-preexec\",\"values\":%" PRIu64 ",\"nodes\":%d,"
+           "\"payload_bytes\":8,\"values_per_iteration\":%d,"
+           "\"measurement_iterations\":%d,\"ns_total_median\":%" PRIu64 ","
+           "\"ns_total_min\":%" PRIu64 ",\"ns_total_max\":%" PRIu64 ","
            "\"ns_per_value\":%.2f,\"messages\":%" PRIu64 ","
            "\"checksum\":%" PRIu64 "}\n\n",
-        value_count, node_count, result.nanoseconds,
-        (double)result.nanoseconds / value_count, result.messages,
+        measured_values, node_count, value_count, measurement_iterations,
+        result.nanoseconds, samples[0].nanoseconds,
+        samples[sample_count - 1].nanoseconds,
+        (double)result.nanoseconds / measured_values, result.messages,
         result.checksum);
-    const uint64_t expected = (uint64_t)value_count * (value_count + 1) / 2;
-    if (result.checksum != expected) {
-        fprintf(stderr, "SELF-CHECK FAILED: checksum mismatch\n");
+    const uint64_t expected = (uint64_t)value_count * (value_count + 1) / 2 *
+        measurement_iterations;
+    const uint64_t expected_messages = measured_values * 12;
+    if (result.checksum != expected || result.messages != expected_messages) {
+        fprintf(stderr, "SELF-CHECK FAILED: checksum or message mismatch\n");
         return 1;
     }
     return 0;
