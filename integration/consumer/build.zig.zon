@@ -1,0 +1,10 @@
+.{
+    .name = .paxos_consumer_check,
+    .version = "0.0.0",
+    .fingerprint = 0x1dc02ca925c46658, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .paxos = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
