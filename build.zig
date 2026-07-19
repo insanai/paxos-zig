@@ -16,6 +16,27 @@ pub fn build(b: *std.Build) void {
     addBenchmarks(b, target);
     addFormatting(b);
     addBook(b);
+    addZaxonlite(b);
+}
+
+fn addZaxonlite(b: *std.Build) void {
+    // Zaxonlite is its own package (it pins the SQLite amalgamation and
+    // depends on this package by path), so its steps run in its directory.
+    const tests = b.addSystemCommand(&.{ "zig", "build", "test" });
+    tests.setCwd(b.path("zaxonlite"));
+    const test_step = b.step(
+        "test-zaxonlite",
+        "Run the zaxonlite (embedded replicated SQLite) test suite",
+    );
+    test_step.dependOn(&tests.step);
+
+    const install = b.addSystemCommand(&.{ "zig", "build" });
+    install.setCwd(b.path("zaxonlite"));
+    const zaxon_step = b.step(
+        "zaxon",
+        "Build the zaxon CLI into zaxonlite/zig-out/bin",
+    );
+    zaxon_step.dependOn(&install.step);
 }
 
 fn addApiDocs(b: *std.Build, paxos: *std.Build.Module) void {
@@ -192,4 +213,15 @@ fn addBook(b: *std.Build) void {
     book.addArg("docs/part-time-parliament.pdf");
     const book_step = b.step("book", "Build the Part Time Parliament book");
     book_step.dependOn(&book.step);
+
+    const zaxonlite_book = b.addSystemCommand(&.{
+        "typst", "compile", "--root", ".",
+    });
+    zaxonlite_book.addFileArg(b.path("docs/zaxonlite/book.typ"));
+    zaxonlite_book.addArg("docs/zaxonlite/zaxonlite.pdf");
+    const zaxonlite_book_step = b.step(
+        "book-zaxonlite",
+        "Build the Zaxonlite book (docs/zaxonlite/zaxonlite.pdf)",
+    );
+    zaxonlite_book_step.dependOn(&zaxonlite_book.step);
 }
