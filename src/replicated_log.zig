@@ -137,8 +137,20 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 membership: *const Membership,
                 durable: *const DurableState,
             ) !void {
+                try self.restoreWithPriority(id, configuration_id, membership, durable, 0);
+            }
+
+            /// Restores one configuration with an election priority.
+            pub fn restoreWithPriority(
+                self: *Node,
+                id: protocol.NodeId,
+                configuration_id: u64,
+                membership: *const Membership,
+                durable: *const DurableState,
+                leader_priority: u32,
+            ) !void {
                 if (configuration_id == 0) return error.InvalidConfigurationId;
-                try self.core.restore(id, membership, durable);
+                try self.core.restoreWithPriority(id, membership, durable, leader_priority);
                 self.configuration_id = configuration_id;
                 self.stop_sign = null;
                 self.stop_pending = false;
