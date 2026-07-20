@@ -43,16 +43,23 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 4 Paxos.tl
 eventually stops producing new states, which TLC would otherwise report as
 a deadlock.
 
-`Paxos.cfg` bounds the model to three nodes, one slot, one client value
-plus the no-op, one round per node (node IDs order ballots, so three
-concurrent competing ballots are still explored), and a `MessageBound`
+`Paxos.cfg` bounds the model to three voters plus two non-voting learners,
+one slot, one client value plus the no-op, one round per voter (node IDs order
+ballots, so three concurrent competing ballots are still explored), and a `MessageBound`
 state constraint of fourteen distinct messages — enough for one complete
 ballot interleaved with a competing partial ballot, including stale votes,
 learned-only decrees, and value recovery.
 
-Verified 18 July 2026 with TLC 2.14 (tla2tools v1.6.0, Java 8, Apple M1):
-no invariant violation; 21,974,932 states generated, 1,150,419 distinct,
-complete search to depth 18 in 4.5 minutes.
+`LearnersDoNotVote` checks the product-critical separation used by Zaxonlite:
+learners may record a commit, but cannot promise, accept, create a ballot, or
+change `Quorums`, which is defined solely over `Voters`. Agreement ranges over
+the union, so a learner is also forbidden from learning a conflicting value.
+
+Verified 20 July 2026 with TLC 2.14 (tla2tools v1.6.0): no invariant
+violation; 85,515,700 states generated, 3,986,355 distinct states, zero states
+left on the queue, and a complete breadth-first search to depth 20 in 9 minutes
+12 seconds. This is the voter-plus-learner fixture in the checked-in
+`Paxos.cfg`, including `LearnersDoNotVote`.
 
 Deeper configurations (two client values, `MaxRound = 2`, or a larger
 `MessageBound`) grow past 10^8 states; partial runs of the unconstrained

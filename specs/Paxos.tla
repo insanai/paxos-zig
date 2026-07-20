@@ -20,13 +20,15 @@
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
-CONSTANTS Nodes, Slots, Values, MaxRound, Noop, None
+CONSTANTS Voters, Learners, Slots, Values, MaxRound, Noop, None
+
+Nodes == Voters \cup Learners
 
 AllValues == Values \cup {Noop}
 
 ZeroBallot == <<0, 0>>
 
-Ballots == (1..MaxRound) \X Nodes
+Ballots == (1..MaxRound) \X Voters
 
 BallotLt(a, b) == \/ a[1] < b[1]
                   \/ /\ a[1] = b[1]
@@ -36,7 +38,7 @@ BallotLe(a, b) == BallotLt(a, b) \/ a = b
 
 (* Majority quorums; replace with any read/write families whose members    *)
 (* pairwise intersect to model the flexible-quorum configuration.          *)
-Quorums == {S \in SUBSET Nodes : 2 * Cardinality(S) > Cardinality(Nodes)}
+Quorums == {S \in SUBSET Voters : 2 * Cardinality(S) > Cardinality(Voters)}
 
 VARIABLES promised, accepted, committed, msgs
 
@@ -140,8 +142,9 @@ Learn(n) ==
     /\ UNCHANGED <<promised, accepted, msgs>>
 
 Next ==
-  \/ \E r \in 1..MaxRound, n \in Nodes : Prepare(r, n)
-  \/ \E n \in Nodes : Promise(n) \/ Vote(n) \/ Learn(n)
+  \/ \E r \in 1..MaxRound, n \in Voters : Prepare(r, n)
+  \/ \E n \in Voters : Promise(n) \/ Vote(n)
+  \/ \E n \in Nodes : Learn(n)
   \/ \E b \in Ballots, s \in Slots : Accept(b, s) \/ Decide(b, s)
 
 Spec == Init /\ [][Next]_vars
@@ -173,6 +176,13 @@ PromisedDominatesVotes ==
 Validity ==
   \A n \in Nodes, s \in Slots :
     committed[n][s] /= None => committed[n][s] \in AllValues
+
+(* Learners can record chosen values but never promise or accept. Adding or *)
+(* removing learners therefore cannot change a quorum or the chosen value.  *)
+LearnersDoNotVote ==
+  \A n \in Learners, s \in Slots :
+    /\ promised[n] = ZeroBallot
+    /\ accepted[n][s] = None
 
 ----------------------------------------------------------------------------
 (* Bounded model checking: the monotonic message set makes the full state  *)

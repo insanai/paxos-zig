@@ -129,6 +129,20 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 self.stop_pending = false;
             }
 
+            /// Initializes a non-voting learner for this configuration.
+            pub fn initLearner(
+                self: *Node,
+                id: protocol.NodeId,
+                configuration_id: u64,
+                membership: *const Membership,
+            ) !void {
+                if (configuration_id == 0) return error.InvalidConfigurationId;
+                try self.core.initLearner(id, membership);
+                self.configuration_id = configuration_id;
+                self.stop_sign = null;
+                self.stop_pending = false;
+            }
+
             /// Restores one configuration from replayed durable state.
             pub fn restore(
                 self: *Node,
@@ -151,6 +165,22 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             ) !void {
                 if (configuration_id == 0) return error.InvalidConfigurationId;
                 try self.core.restoreWithPriority(id, membership, durable, leader_priority);
+                self.configuration_id = configuration_id;
+                self.stop_sign = null;
+                self.stop_pending = false;
+                self.observeDurable();
+            }
+
+            /// Restores a non-voting learner from its commit-only journal.
+            pub fn restoreLearner(
+                self: *Node,
+                id: protocol.NodeId,
+                configuration_id: u64,
+                membership: *const Membership,
+                durable: *const DurableState,
+            ) !void {
+                if (configuration_id == 0) return error.InvalidConfigurationId;
+                try self.core.restoreLearner(id, membership, durable);
                 self.configuration_id = configuration_id;
                 self.stop_sign = null;
                 self.stop_pending = false;
@@ -255,6 +285,18 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             /// Processes one protocol message and observes committed stop signs.
             pub fn step(self: *Node, envelope: Envelope, effects: *Effects) !void {
                 try self.core.step(envelope, effects);
+                self.observeEffects(effects);
+            }
+
+            /// Records one host-certified chosen entry on a non-voting learner.
+            pub fn learnChosen(
+                self: *Node,
+                from: protocol.NodeId,
+                slot: protocol.Slot,
+                entry: Entry,
+                effects: *Effects,
+            ) !void {
+                try self.core.learnChosen(from, slot, entry, effects);
                 self.observeEffects(effects);
             }
 
@@ -430,6 +472,28 @@ test "checkpoint seals an epoch and initializes the next one" {
     try next.initFromStop(1, &stop, &next_membership, 9);
     try std.testing.expectEqual(@as(u64, 12), next.configurationId());
     try std.testing.expectEqual(@as(u32, 9), next.core.leader_priority);
+}
+
+test "replicated log learner observes a chosen stop sign" {
+    const Log = ReplicatedLog(u64, .{
+        .max_members = 3,
+        .max_entries = 4,
+        .max_batch = 2,
+    });
+    var membership: Log.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var learner: Log.Node = undefined;
+    try learner.initLearner(10, 4, &membership);
+    var effects = Log.Effects{};
+    effects.init();
+    const stop = try Log.StopSign.create(5, &.{ 2, 3, 4 }, "snapshot");
+
+    try learner.learnChosen(1, 1, .{ .stop = stop }, &effects);
+    try std.testing.expect(learner.isReconfigured() != null);
+    try std.testing.expectEqual(
+        @as(u64, 5),
+        learner.isReconfigured().?.configuration_id,
+    );
 }
 
 test "restore remains sealed after accepting a stop sign" {

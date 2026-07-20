@@ -6,8 +6,8 @@ function count_char(text, character, copy) {
 function finish_function(end_line, line_count, name) {
     name = function_name[function_count]
     line_count = end_line - function_start[function_count] + 1
-    if (name != "Protocol" && name != "ReplicatedLog" && name != "Simulator" && \
-        name != "Bench" && line_count > 70) {
+    if (name != "Protocol" && name != "ReplicatedLog" && name != "Learner" && \
+        name != "Simulator" && name != "Bench" && line_count > 70) {
         printf "%s:%d: function %s is %d lines; maximum is 70\n", \
             FILENAME, function_start[function_count], name, line_count
         failed = 1

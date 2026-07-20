@@ -378,6 +378,10 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             next_slot: Slot = 1,
             delivered_through: Slot = 0,
             leader_priority: u32 = 0,
+            voting_member: bool = true,
+            /// Acceptor-only participants keep voting but never start phase one.
+            /// This is a liveness policy; it does not change Paxos safety.
+            campaign_enabled: bool = true,
             election_ticks: u32 = 0,
             heartbeat_ticks: u32 = 0,
             resend_ticks: u32 = 0,
@@ -423,6 +427,25 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 self.assertValid();
             }
 
+            /// Initializes a non-voting learner for host-certified decisions.
+            /// The learner ID must be outside the acceptor membership.
+            pub fn initLearner(
+                self: *Node,
+                id: NodeId,
+                membership: *const Membership,
+            ) !void {
+                if (id == 0) return error.InvalidNodeId;
+                if (membership.contains(id)) return error.LearnerIsVoter;
+                self.* = .{
+                    .id = id,
+                    .membership = membership.*,
+                    .durable = .{},
+                    .voting_member = false,
+                    .campaign_enabled = false,
+                };
+                self.assertValid();
+            }
+
             /// Restores a priority-zero member from replayed durable state.
             pub fn restore(
                 self: *Node,
@@ -447,11 +470,35 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 self.assertValid();
             }
 
+            /// Restores a non-voting learner from its commit-only journal.
+            pub fn restoreLearner(
+                self: *Node,
+                id: NodeId,
+                membership: *const Membership,
+                durable: *const DurableState,
+            ) !void {
+                try self.initLearner(id, membership);
+                self.durable = durable.*;
+                self.next_slot = slotAfter(self.highestUsedSlot());
+                self.assertValid();
+            }
+
             /// Starts phase one with a locally unique, monotonically increasing ballot.
             pub fn campaign(self: *Node, noop: Value, effects: *Effects) !void {
                 self.assertValid();
                 effects.reset();
+                if (!self.voting_member) return error.NotVoter;
+                if (!self.campaign_enabled) return error.CampaignDisabled;
                 try self.startCampaign(noop, effects);
+                self.assertValid();
+            }
+
+            /// Enables or disables automatic and explicit phase-one campaigns.
+            /// A disabled node remains a full acceptor and learner.
+            pub fn setCampaignEnabled(self: *Node, enabled: bool) void {
+                self.assertValid();
+                self.campaign_enabled = enabled;
+                if (!enabled and self.role == .preparing) self.role = .follower;
                 self.assertValid();
             }
 
@@ -459,6 +506,7 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             pub fn propose(self: *Node, value: Value, effects: *Effects) !Slot {
                 self.assertValid();
                 effects.reset();
+                if (!self.voting_member) return error.NotVoter;
                 if (self.role != .leader) return error.NotLeader;
                 if (self.next_slot == 0) return error.SlotLimitReached;
 
@@ -479,6 +527,7 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             ) ![]const Slot {
                 self.assertValid();
                 effects.reset();
+                if (!self.voting_member) return error.NotVoter;
                 if (self.role != .leader) return error.NotLeader;
                 if (values.len == 0) return error.EmptyBatch;
                 if (slots.len < values.len) return error.SlotBufferTooSmall;
@@ -502,6 +551,7 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             pub fn tick(self: *Node, noop: Value, effects: *Effects) !void {
                 self.assertValid();
                 effects.reset();
+                if (!self.voting_member) return;
                 self.election_ticks +|= 1;
                 self.heartbeat_ticks +|= 1;
                 self.resend_ticks +|= 1;
@@ -509,7 +559,9 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 if (self.role == .leader) {
                     self.sendHeartbeatIfDue(effects);
                     self.resendIfDue(effects);
-                } else if (self.election_ticks >= options.election_timeout_ticks) {
+                } else if (self.campaign_enabled and
+                    self.election_ticks >= options.election_timeout_ticks)
+                {
                     try self.startCampaign(noop, effects);
                 }
                 self.assertValid();
@@ -564,6 +616,17 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                     self.peer_decided_through[member] = @max(self.peer_decided_through[member], dt);
                 }
 
+                if (!self.voting_member) {
+                    return switch (envelope.message) {
+                        .commit => |message| self.onCommit(
+                            envelope.from,
+                            message,
+                            effects,
+                        ),
+                        else => error.LearnerMessageForbidden,
+                    };
+                }
+
                 switch (envelope.message) {
                     .prepare => |message| try self.onPrepare(
                         envelope.from,
@@ -611,6 +674,23 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 self.assertValid();
             }
 
+            /// Installs one value that the host has certified as chosen by the
+            /// current acceptor configuration. Intended for non-voting learners.
+            pub fn learnChosen(
+                self: *Node,
+                from: NodeId,
+                slot: Slot,
+                value: Value,
+                effects: *Effects,
+            ) !void {
+                self.assertValid();
+                effects.reset();
+                if (self.voting_member) return error.NotLearner;
+                if (!self.membership.contains(from)) return error.NotMember;
+                try self.onCommit(from, .{ .slot = slot, .value = value }, effects);
+                self.assertValid();
+            }
+
             /// Returns a learned value, or null for an undecided or invalid slot.
             pub fn committedAt(self: *const Node, slot: Slot) ?Value {
                 self.assertValid();
@@ -652,7 +732,12 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             fn assertValid(self: *const Node) void {
                 if (!std.debug.runtime_safety) return;
                 std.debug.assert(self.id != 0);
-                std.debug.assert(self.membership.contains(self.id));
+                if (self.voting_member) {
+                    std.debug.assert(self.membership.contains(self.id));
+                } else {
+                    std.debug.assert(!self.membership.contains(self.id));
+                    std.debug.assert(!self.campaign_enabled);
+                }
                 std.debug.assert(self.membership.count > 0);
                 std.debug.assert(self.membership.count <= options.max_members);
                 std.debug.assert(self.next_slot <= options.max_slots);
@@ -1243,6 +1328,58 @@ test "membership rejects invalid configurations" {
     try std.testing.expectError(error.EmptyMembership, membership.init(&.{}));
     try std.testing.expectError(error.InvalidNodeId, membership.init(&.{ 1, 0 }));
     try std.testing.expectError(error.DuplicateNodeId, membership.init(&.{ 1, 1 }));
+}
+
+test "acceptor-only member never campaigns but still promises" {
+    const P = Protocol(u64, .{ .max_members = 3, .max_slots = 4 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var node: P.Node = undefined;
+    try node.init(2, &membership);
+    node.setCampaignEnabled(false);
+    var effects = P.Effects{};
+    effects.init();
+
+    try std.testing.expectError(error.CampaignDisabled, node.campaign(0, &effects));
+    for (0..20) |_| try node.tick(0, &effects);
+    try std.testing.expectEqual(P.Role.follower, node.role);
+
+    try node.step(.{
+        .from = 1,
+        .to = 2,
+        .message = .{ .prepare = .{
+            .ballot = .{ .round = 1, .node = 1 },
+            .decided_through = 0,
+        } },
+    }, &effects);
+    try std.testing.expect(effects.writesSlice().len > 0);
+    effects.confirmWritesDurable();
+    try std.testing.expect(effects.messagesSlice().len > 0);
+}
+
+test "non-voting learner records only host-certified chosen values" {
+    const P = Protocol(u64, .{ .max_members = 3, .max_slots = 4 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var learner: P.Node = undefined;
+    try learner.initLearner(10, &membership);
+    var effects = P.Effects{};
+    effects.init();
+
+    try std.testing.expectError(error.NotVoter, learner.campaign(0, &effects));
+    try learner.learnChosen(1, 2, 22, &effects);
+    try std.testing.expectEqual(@as(usize, 1), effects.writesSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), effects.committedSlice().len);
+    effects.confirmWritesDurable();
+    try learner.learnChosen(2, 1, 11, &effects);
+    try std.testing.expectEqual(@as(usize, 2), effects.committedSlice().len);
+    try std.testing.expectEqual(@as(u64, 11), effects.committedSlice()[0].value);
+    try std.testing.expectEqual(@as(u64, 22), effects.committedSlice()[1].value);
+    effects.confirmWritesDurable();
+    try std.testing.expectError(
+        error.NotMember,
+        learner.learnChosen(99, 3, 33, &effects),
+    );
 }
 
 test "flexible read and write quorums must intersect" {
