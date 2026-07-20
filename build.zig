@@ -51,6 +51,19 @@ fn addApiDocs(b: *std.Build, paxos: *std.Build.Module) void {
     });
     const docs_step = b.step("docs", "Generate the Zig API documentation");
     docs_step.dependOn(&install_docs.step);
+
+    // The autodoc output is a WASM application; browsers refuse to load it
+    // from file://, so serve the installed directory over local HTTP.
+    const serve_docs = b.addSystemCommand(&.{
+        "python3", "-m", "http.server", "8000", "-d",
+    });
+    serve_docs.addArg(b.getInstallPath(.prefix, "docs/api"));
+    serve_docs.step.dependOn(&install_docs.step);
+    const serve_step = b.step(
+        "docs-serve",
+        "Serve the API documentation at http://localhost:8000",
+    );
+    serve_step.dependOn(&serve_docs.step);
 }
 
 fn addExample(
@@ -116,6 +129,18 @@ fn addSimulation(
     const sim_tests = b.addTest(.{ .root_module = sim_module });
     const run_sim_tests = b.addRunArtifact(sim_tests);
     test_step.dependOn(&run_sim_tests.step);
+
+    // Deterministic multi-node reconfiguration harness for the replicated
+    // log: stop-sign sealing, checkpoint, and epoch handover oracles.
+    const reconfiguration_module = b.createModule(.{
+        .root_source_file = b.path("sim/reconfiguration.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "paxos", .module = paxos }},
+    });
+    const reconfiguration_tests = b.addTest(.{ .root_module = reconfiguration_module });
+    const run_reconfiguration_tests = b.addRunArtifact(reconfiguration_tests);
+    test_step.dependOn(&run_reconfiguration_tests.step);
 
     const sim_exe = b.addExecutable(.{
         .name = "paxos-sim",

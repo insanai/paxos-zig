@@ -31,6 +31,14 @@ zig build fmt
 The example elects node 1, commits three counter commands, and applies the same
 ordered log at all three replicas.
 
+## API documentation
+
+`zig build docs` writes the generated API reference to `zig-out/docs/api`.
+The output is a WASM application that browsers refuse to load from `file://`,
+so run `zig build docs-serve` and open <http://localhost:8000>. CI publishes
+the same pages (this package plus zaxonlite) to GitHub Pages at
+`https://<owner>.github.io/paxos-zig/` on every push to `main`.
+
 ## Add it as a Zig dependency
 
 Once a release is tagged on Codeberg, let Zig calculate and pin its content
