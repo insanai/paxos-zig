@@ -1,3 +1,13 @@
+//! A pure, bounded Multi-Paxos state machine with explicit effects.
+//!
+//! The core owns no sockets, threads, clocks, or heap. The host feeds one
+//! `Envelope`, tick, or proposal into a `Node` and receives `Effects`: durable
+//! writes, outbound messages, and newly decided entries. Safety rests on the
+//! host honoring one ordering rule: persist and sync every record in
+//! `writesSlice`, call `confirmWritesDurable`, and only then transmit
+//! `messagesSlice`. A reply sent before its write is durable can retract a
+//! promise or vote after a crash and break agreement.
+
 const std = @import("std");
 const BitSet = @import("bit_set.zig").BitSet;
 
@@ -32,6 +42,8 @@ pub const Ballot = struct {
     priority: u32 = 0,
     node: NodeId,
 
+    /// Orders below every real ballot. Marks "no promise yet" and tags votes
+    /// synthesized for decrees learned without voting (see `Promise`).
     pub const zero: Ballot = .{ .round = 0, .node = 0 };
 
     /// Compares round, configured priority, and node ID in that order.
@@ -87,6 +99,9 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
     return struct {
         const Self = @This();
 
+        /// One acceptor vote: the ballot it was cast in and the value voted
+        /// for. Phase one keeps the highest-ballot vote per slot, which is
+        /// exactly the evidence condition B3 requires a new leader to honor.
         pub const Accepted = struct {
             ballot: Ballot,
             value: Value,
@@ -156,39 +171,72 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             }
         };
 
+        /// Phase one request (Lamport's NextBallot). `decided_through` is the
+        /// candidate's contiguous decided prefix; promisers report votes only
+        /// for slots above it, bounding the size of the reply stream.
         pub const Prepare = struct { ballot: Ballot, decided_through: Slot };
+        /// Phase one reply carrying one slot's LastVote evidence. An acceptor
+        /// sends one promise per known slot above the candidate's decided
+        /// prefix and marks the end of the stream with `PromiseDone`. A decree
+        /// this node learned without ever voting travels as a zero-ballot
+        /// vote: it loses to every real vote, so it can never override the
+        /// choosing quorum's value, yet it lets a candidate that is behind on
+        /// the log recover already-committed decrees.
         pub const Promise = struct {
             ballot: Ballot,
             slot: Slot,
             accepted: Accepted,
         };
+        /// Phase one completion marker. `accepted_count` is how many `Promise`
+        /// messages this acceptor sent for `ballot`, so the candidate can
+        /// recognize a complete promise set even when the network reorders
+        /// the marker ahead of the promises it counts.
         pub const PromiseDone = struct {
             ballot: Ballot,
             accepted_count: Slot,
             decided_through: Slot,
         };
+        /// Phase two request (Lamport's BeginBallot): vote for `value` in
+        /// `slot` unless a higher ballot has already been promised.
         pub const Accept = struct {
             ballot: Ballot,
             slot: Slot,
             value: Value,
         };
+        /// Phase two vote acknowledgement. Sent only after the vote is
+        /// durable, so a leader counting these toward the write quorum is
+        /// counting synced disks, not volatile memory. `decided_through`
+        /// refreshes the leader's retransmission view of this acceptor.
         pub const AcceptedMessage = struct {
             ballot: Ballot,
             slot: Slot,
             decided_through: Slot,
         };
+        /// Announcement that `value` was chosen for `slot`. Commits carry no
+        /// ballot: a chosen value can never change, so any commit for a slot
+        /// is authoritative regardless of which leader sends it.
         pub const Commit = struct {
             slot: Slot,
             value: Value,
         };
+        /// Catch-up request: send every known commit at or above `from_slot`.
         pub const Learn = struct { from_slot: Slot };
+        /// Rejection of `rejected` by an acceptor already promised to
+        /// `promised`. Nacks are a liveness aid only: they steer the loser
+        /// back to follower and seed its next ballot round. Safety never
+        /// depends on a nack arriving.
         pub const Nack = struct {
             rejected: Ballot,
             promised: Ballot,
             decided_through: Slot,
         };
+        /// Leader liveness beacon. `decided_through` advertises the leader's
+        /// decided prefix so a restarted or lagging follower can request
+        /// catch-up without any explicit recovery handshake.
         pub const Heartbeat = struct { ballot: Ballot, decided_through: Slot };
 
+        /// The complete wire vocabulary. Serialization is the host's concern;
+        /// every payload is self-contained and free of pointers.
         pub const Message = union(enum) {
             prepare: Prepare,
             promise: Promise,
@@ -201,6 +249,9 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             heartbeat: Heartbeat,
         };
 
+        /// One addressed message. `step` rejects envelopes not addressed to
+        /// the local node and senders outside the fixed membership, but it
+        /// trusts `from`; the host transport must authenticate the sender.
         pub const Envelope = struct {
             from: NodeId,
             to: NodeId,
@@ -221,6 +272,8 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             },
         };
 
+        /// One decided entry released to the application. Entries are always
+        /// released in slot order as a contiguous prefix, never with gaps.
         pub const Committed = struct {
             slot: Slot,
             value: Value,
@@ -314,6 +367,10 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             accepted: [options.max_slots]?Accepted = [_]?Accepted{null} ** options.max_slots,
             committed: [options.max_slots]?Value = [_]?Value{null} ** options.max_slots,
 
+            /// Replays one journal record in original write order. Regressed
+            /// promises and conflicting values are reported as errors, not
+            /// repaired: a journal that violates durable monotonicity is
+            /// corrupt, and the node must stop rather than vote from it.
             pub fn apply(self: *DurableState, write: Write) !void {
                 self.assertValid();
                 switch (write) {
@@ -364,6 +421,9 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             }
         };
 
+        /// Proposer status. A `follower` acts only as acceptor and learner,
+        /// `preparing` is running phase one, and a `leader` has completed
+        /// phase one and may propose new values.
         pub const Role = enum { follower, preparing, leader };
 
         /// One protocol participant containing proposer, acceptor, and learner roles.
@@ -447,6 +507,11 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             }
 
             /// Restores a priority-zero member from replayed durable state.
+            ///
+            /// `decidedThrough()` reports 0 after restore until this node next
+            /// observes a commit or wins an election, so `readDecided` cannot
+            /// replay history yet. The host must rebuild application state
+            /// from its own snapshot, not from this node.
             pub fn restore(
                 self: *Node,
                 id: NodeId,
@@ -457,6 +522,11 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             }
 
             /// Restores a prioritized member from replayed durable state.
+            ///
+            /// `decidedThrough()` reports 0 after restore until this node next
+            /// observes a commit or wins an election, so `readDecided` cannot
+            /// replay history yet. The host must rebuild application state
+            /// from its own snapshot, not from this node.
             pub fn restoreWithPriority(
                 self: *Node,
                 id: NodeId,
@@ -1823,6 +1893,240 @@ test "catch-up returns known commits from the requested slot" {
     for (effects.messagesSlice()) |message| {
         try std.testing.expectEqual(@as(NodeId, 2), message.to);
     }
+}
+
+test "reconnected leader retransmits missing commits and open accepts" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var leader: TestProtocol.Node = undefined;
+    try leader.init(1, &membership);
+    leader.role = .leader;
+    leader.ballot = .{ .round = 1, .node = 1 };
+    leader.durable.promised = leader.ballot;
+    leader.durable.committed[0] = 10;
+    leader.proposals[1] = 20;
+    var effects = TestProtocol.Effects{};
+
+    // The peer reported no progress, so it receives the decided slot as a
+    // commit and the still-open slot as a fresh accept, in slot order.
+    try leader.reconnected(2, &effects);
+    try std.testing.expectEqual(@as(usize, 2), effects.messages_count);
+    const commit = effects.messagesSlice()[0];
+    try std.testing.expectEqual(@as(NodeId, 2), commit.to);
+    try std.testing.expect(commit.message == .commit);
+    try std.testing.expectEqual(@as(Slot, 1), commit.message.commit.slot);
+    try std.testing.expectEqual(@as(u64, 10), commit.message.commit.value);
+    const accept = effects.messagesSlice()[1];
+    try std.testing.expectEqual(@as(NodeId, 2), accept.to);
+    try std.testing.expect(accept.message == .accept);
+    try std.testing.expectEqual(@as(Slot, 2), accept.message.accept.slot);
+    try std.testing.expectEqual(@as(u64, 20), accept.message.accept.value);
+
+    try std.testing.expectError(error.InvalidPeer, leader.reconnected(1, &effects));
+    try std.testing.expectError(error.NotMember, leader.reconnected(9, &effects));
+}
+
+test "reconnected follower asks its leader for undelivered decisions" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var follower: TestProtocol.Node = undefined;
+    try follower.init(2, &membership);
+    follower.leader_hint = 1;
+    follower.durable.committed[0] = 10;
+    follower.delivered_through = 1;
+    var effects = TestProtocol.Effects{};
+
+    // Reconnecting to the presumed leader requests everything undelivered.
+    try follower.reconnected(1, &effects);
+    try std.testing.expectEqual(@as(usize, 1), effects.messages_count);
+    const request = effects.messagesSlice()[0];
+    try std.testing.expectEqual(@as(NodeId, 1), request.to);
+    try std.testing.expect(request.message == .learn);
+    try std.testing.expectEqual(@as(Slot, 2), request.message.learn.from_slot);
+
+    // Reconnecting to a peer that is not the leader hint repairs nothing.
+    try follower.reconnected(3, &effects);
+    try std.testing.expectEqual(@as(usize, 0), effects.messages_count);
+}
+
+test "requestCatchUp round trip returns decided entries from the slot" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var provider: TestProtocol.Node = undefined;
+    try provider.init(1, &membership);
+    provider.durable.committed[0] = 10;
+    provider.durable.committed[1] = 20;
+    provider.durable.committed[2] = 30;
+    var lagging: TestProtocol.Node = undefined;
+    try lagging.init(2, &membership);
+    lagging.durable.committed[0] = 10;
+    lagging.delivered_through = 1;
+    var effects = TestProtocol.Effects{};
+
+    try std.testing.expectError(
+        error.InvalidSlot,
+        lagging.requestCatchUp(1, 0, &effects),
+    );
+    try std.testing.expectError(
+        error.NotMember,
+        lagging.requestCatchUp(9, 2, &effects),
+    );
+
+    try lagging.requestCatchUp(1, 2, &effects);
+    try std.testing.expectEqual(@as(usize, 1), effects.messages_count);
+    const request = effects.messagesSlice()[0];
+    try std.testing.expectEqual(@as(NodeId, 1), request.to);
+    try std.testing.expect(request.message == .learn);
+    try std.testing.expectEqual(@as(Slot, 2), request.message.learn.from_slot);
+
+    // The provider answers with every known commit at or above the slot,
+    // and delivering those commits advances the lagging decided prefix.
+    var provider_effects = TestProtocol.Effects{};
+    try provider.step(request, &provider_effects);
+    try std.testing.expectEqual(@as(usize, 2), provider_effects.messages_count);
+    for (provider_effects.messagesSlice()) |envelope| {
+        try std.testing.expectEqual(@as(NodeId, 2), envelope.to);
+        try std.testing.expect(envelope.message == .commit);
+        try lagging.step(envelope, &effects);
+        effects.confirmWritesDurable();
+    }
+    try std.testing.expectEqual(@as(Slot, 3), lagging.decidedThrough());
+    try std.testing.expectEqual(@as(?u64, 20), lagging.committedAt(2));
+    try std.testing.expectEqual(@as(?u64, 30), lagging.committedAt(3));
+}
+
+test "resendIfDue retransmits to lagging peers after the resend interval" {
+    const P = Protocol(u64, .{
+        .max_members = 3,
+        .max_slots = 4,
+        .election_timeout_ticks = 20,
+        .heartbeat_interval_ticks = 16,
+        .resend_interval_ticks = 2,
+    });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var leader: P.Node = undefined;
+    try leader.init(1, &membership);
+    leader.role = .leader;
+    leader.ballot = .{ .round = 1, .node = 1 };
+    leader.durable.promised = leader.ballot;
+    leader.durable.committed[0] = 10;
+    leader.proposals[1] = 20;
+    var effects = P.Effects{};
+
+    // Nothing is retransmitted before the interval of silence elapses.
+    try leader.tick(0, &effects);
+    try std.testing.expectEqual(@as(usize, 0), effects.messages_count);
+    // At the interval, both lagging peers receive the decided slot as a
+    // commit and the open slot as an accept.
+    try leader.tick(0, &effects);
+    try std.testing.expectEqual(@as(usize, 4), effects.messages_count);
+    for (effects.messagesSlice()) |envelope| {
+        try std.testing.expect(
+            envelope.message == .commit or envelope.message == .accept,
+        );
+    }
+    // The interval counter resets, so the next tick is silent again.
+    try leader.tick(0, &effects);
+    try std.testing.expectEqual(@as(usize, 0), effects.messages_count);
+
+    // A peer that reported progress is only sent what it still misses.
+    leader.peer_decided_through[1] = 1;
+    try leader.tick(0, &effects);
+    try std.testing.expectEqual(@as(usize, 3), effects.messages_count);
+    for (effects.messagesSlice()) |envelope| {
+        if (envelope.to == 2) try std.testing.expect(envelope.message == .accept);
+    }
+}
+
+test "heartbeat ahead of the follower triggers a catch-up request" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var follower: TestProtocol.Node = undefined;
+    try follower.init(2, &membership);
+    const leader_ballot = Ballot{ .round = 1, .node = 1 };
+    follower.durable.promised = leader_ballot;
+    var effects = TestProtocol.Effects{};
+
+    // The leader advertises a longer decided prefix; the follower learns.
+    try follower.step(.{
+        .from = 1,
+        .to = 2,
+        .message = .{ .heartbeat = .{
+            .ballot = leader_ballot,
+            .decided_through = 3,
+        } },
+    }, &effects);
+    try std.testing.expectEqual(@as(usize, 1), effects.messages_count);
+    const request = effects.messagesSlice()[0];
+    try std.testing.expectEqual(@as(NodeId, 1), request.to);
+    try std.testing.expect(request.message == .learn);
+    try std.testing.expectEqual(@as(Slot, 1), request.message.learn.from_slot);
+    try std.testing.expectEqual(@as(?NodeId, 1), follower.currentLeader());
+
+    // A heartbeat that is not ahead of this follower requests nothing.
+    try follower.step(.{
+        .from = 1,
+        .to = 2,
+        .message = .{ .heartbeat = .{
+            .ballot = leader_ballot,
+            .decided_through = 0,
+        } },
+    }, &effects);
+    try std.testing.expectEqual(@as(usize, 0), effects.messages_count);
+}
+
+test "nack for a higher promise steps the leader down" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var leader: TestProtocol.Node = undefined;
+    try leader.init(1, &membership);
+    leader.role = .leader;
+    leader.ballot = .{ .round = 1, .node = 1 };
+    leader.durable.promised = leader.ballot;
+    var effects = TestProtocol.Effects{};
+
+    // A nack for a ballot this node never issued is ignored.
+    try leader.step(.{
+        .from = 2,
+        .to = 1,
+        .message = .{ .nack = .{
+            .rejected = .{ .round = 9, .node = 1 },
+            .promised = .{ .round = 10, .node = 2 },
+            .decided_through = 0,
+        } },
+    }, &effects);
+    try std.testing.expectEqual(TestProtocol.Role.leader, leader.role);
+
+    // A nack that names no higher promise is ignored.
+    try leader.step(.{
+        .from = 2,
+        .to = 1,
+        .message = .{ .nack = .{
+            .rejected = leader.ballot,
+            .promised = leader.ballot,
+            .decided_through = 0,
+        } },
+    }, &effects);
+    try std.testing.expectEqual(TestProtocol.Role.leader, leader.role);
+
+    // A higher promise abandons leadership and adopts the winner as hint.
+    try leader.step(.{
+        .from = 2,
+        .to = 1,
+        .message = .{ .nack = .{
+            .rejected = leader.ballot,
+            .promised = .{ .round = 2, .node = 2 },
+            .decided_through = 0,
+        } },
+    }, &effects);
+    try std.testing.expectEqual(TestProtocol.Role.follower, leader.role);
+    try std.testing.expectEqual(@as(?NodeId, 2), leader.currentLeader());
+    try std.testing.expectEqual(@as(u64, 2), leader.highest_observed_round);
+
+    // The next campaign picks a round above the observed higher promise.
+    try leader.campaign(0, &effects);
+    try std.testing.expectEqual(@as(u64, 3), leader.ballot.round);
 }
 
 fn hasPointers(comptime T: type) bool {

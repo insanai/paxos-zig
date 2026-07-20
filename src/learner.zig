@@ -8,13 +8,19 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
+/// Compile-time capacity of the bounded chosen-value buffer.
 pub const Options = struct {
+    /// Maximum chosen slots retained; slots above this bound are rejected.
     max_entries: usize = 256,
 };
 
+/// Outcome of recording one chosen value.
 pub const LearnResult = enum {
+    /// The identical value was already recorded for this slot; no change.
     duplicate,
+    /// Recorded, but an undecided gap below it still blocks release.
     buffered,
+    /// Recorded, and the contiguous released prefix advanced.
     advanced,
 };
 
@@ -24,6 +30,7 @@ pub fn Learner(comptime Value: type, comptime options: Options) type {
     return struct {
         const Self = @This();
 
+        /// One released chosen value paired with its one-based slot.
         pub const Chosen = struct {
             slot: protocol.Slot,
             value: Value,
@@ -34,6 +41,8 @@ pub fn Learner(comptime Value: type, comptime options: Options) type {
             [_]?Value{null} ** options.max_entries,
         released_through: protocol.Slot = 0,
 
+        /// Replaces `self` with an empty learner bound to one configuration;
+        /// chosen values certified under any other configuration are rejected.
         pub fn init(self: *Self, configuration_id: u64) !void {
             if (configuration_id == 0) return error.InvalidConfigurationId;
             self.* = .{ .configuration_id = configuration_id };
@@ -83,6 +92,9 @@ pub fn Learner(comptime Value: type, comptime options: Options) type {
             return output[0..count];
         }
 
+        /// Returns a released chosen value. Buffered values above the
+        /// contiguous prefix stay hidden until the gap below them fills, so
+        /// applications never observe out-of-order state.
         pub fn chosenAt(self: *const Self, slot: protocol.Slot) ?Value {
             const index = slotIndex(slot) catch return null;
             if (slot > self.released_through) return null;

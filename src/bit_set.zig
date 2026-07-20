@@ -9,6 +9,9 @@ pub fn BitSet(comptime bit_count: usize) type {
         return struct {
             const Self = @This();
             bits: Bits = 0,
+            /// Adds `index`, returning true only on first insertion so
+            /// callers can count distinct members without a second lookup.
+            /// Asserts `index < bit_count` in safe builds.
             pub fn insert(self: *Self, index: usize) bool {
                 std.debug.assert(index < bit_count);
                 const mask = @as(Bits, 1) << @intCast(index);
@@ -16,10 +19,13 @@ pub fn BitSet(comptime bit_count: usize) type {
                 self.bits |= mask;
                 return true;
             }
+            /// Returns whether `index` is present.
+            /// Asserts `index < bit_count` in safe builds.
             pub fn contains(self: Self, index: usize) bool {
                 std.debug.assert(index < bit_count);
                 return self.bits & (@as(Bits, 1) << @intCast(index)) != 0;
             }
+            /// Returns the number of members currently in the set.
             pub fn count(self: Self) usize {
                 return @intCast(@popCount(self.bits));
             }
@@ -31,6 +37,9 @@ pub fn BitSet(comptime bit_count: usize) type {
         return struct {
             const Self = @This();
             words: [word_count]Word = [_]Word{0} ** word_count,
+            /// Adds `index`, returning true only on first insertion so
+            /// callers can count distinct members without a second lookup.
+            /// Asserts `index < bit_count` in safe builds.
             pub fn insert(self: *Self, index: usize) bool {
                 std.debug.assert(index < bit_count);
                 const word_idx = index / word_size;
@@ -39,11 +48,14 @@ pub fn BitSet(comptime bit_count: usize) type {
                 self.words[word_idx] |= mask;
                 return true;
             }
+            /// Returns whether `index` is present.
+            /// Asserts `index < bit_count` in safe builds.
             pub fn contains(self: Self, index: usize) bool {
                 std.debug.assert(index < bit_count);
                 const mask = @as(Word, 1) << @intCast(index % word_size);
                 return self.words[index / word_size] & mask != 0;
             }
+            /// Returns the number of members currently in the set.
             pub fn count(self: Self) usize {
                 var total: usize = 0;
                 for (self.words) |word| total += @popCount(word);

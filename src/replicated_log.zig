@@ -1,3 +1,13 @@
+//! A reconfigurable command log layered on the core protocol.
+//!
+//! Commands and configuration stop signs share one bounded, ordered log. A
+//! decided stop sign seals the epoch: no later command can commit in it, so
+//! the host can transfer application state and start the next configuration
+//! at a slot boundary both sides agree on. Checkpoints reuse the same sealing
+//! mechanism to bound journal growth across snapshot epochs. The durability
+//! contract is inherited unchanged from the core: sync every `Effects` write
+//! and call `confirmWritesDurable` before sending messages.
+
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
@@ -61,10 +71,14 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             return result;
         }
 
+        /// Returns the next configuration's voting members. The slice borrows
+        /// this stop sign's fixed storage and copies nothing.
         pub fn membersSlice(self: *const @This()) []const protocol.NodeId {
             return self.members[0..self.member_count];
         }
 
+        /// Returns the opaque host handover payload (for example, a snapshot
+        /// identifier). The slice borrows this stop sign's fixed storage.
         pub fn metadataSlice(self: *const @This()) []const u8 {
             return self.metadata[0..self.metadata_count];
         }
@@ -86,15 +100,25 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
     });
 
     return struct {
+        /// A decided configuration change: next members plus opaque handover metadata.
         pub const StopSign = StopSignType;
+        /// One log entry: an application command or a sealing stop sign.
         pub const Entry = EntryType;
+        /// Fixed voting membership with validated, intersecting quorums.
         pub const Membership = Core.Membership;
+        /// Caller-owned output buffers; sync writes before sending messages.
         pub const Effects = Core.Effects;
+        /// One addressed protocol message from the fixed membership.
         pub const Envelope = Core.Envelope;
+        /// Wire vocabulary of the core protocol, carrying `Entry` payloads.
         pub const Message = Core.Message;
+        /// One durable journal record; apply in order before sending messages.
         pub const Write = Core.Write;
+        /// Durable acceptor and learner state reconstructed by journal replay.
         pub const DurableState = Core.DurableState;
+        /// One decided entry, released only as a contiguous slot-ordered prefix.
         pub const Committed = Core.Committed;
+        /// Proposer status of the underlying core node.
         pub const Role = Core.Role;
 
         pub const Node = struct {
@@ -144,6 +168,11 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             }
 
             /// Restores one configuration from replayed durable state.
+            ///
+            /// `decidedThrough()` reports 0 after restore until this node next
+            /// observes a commit or wins an election. The host must rebuild
+            /// application state from its own snapshot, not by re-reading
+            /// decided entries from this node.
             pub fn restore(
                 self: *Node,
                 id: protocol.NodeId,
@@ -155,6 +184,11 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             }
 
             /// Restores one configuration with an election priority.
+            ///
+            /// `decidedThrough()` reports 0 after restore until this node next
+            /// observes a commit or wins an election. The host must rebuild
+            /// application state from its own snapshot, not by re-reading
+            /// decided entries from this node.
             pub fn restoreWithPriority(
                 self: *Node,
                 id: protocol.NodeId,
