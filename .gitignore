@@ -8,3 +8,4 @@ docs/part-time-parliament.pdf
 zig-pkg/
 zaxonlite/.zig-cache/
 zaxonlite/zig-out/
+*.log
