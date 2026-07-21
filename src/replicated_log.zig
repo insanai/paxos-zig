@@ -5,8 +5,9 @@
 //! the host can transfer application state and start the next configuration
 //! at a slot boundary both sides agree on. Checkpoints reuse the same sealing
 //! mechanism to bound journal growth across snapshot epochs. The durability
-//! contract is inherited unchanged from the core: sync every `Effects` write
-//! and call `confirmWritesDurable` before sending messages.
+//! contract is inherited unchanged from the core: persist every `Effects`
+//! write and call `confirmWritesDurable` before publishing durable claims.
+//! A host may pipeline only `Effects.preDurableMessages` while its barrier runs.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -106,13 +107,13 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
         pub const Entry = EntryType;
         /// Fixed voting membership with validated, intersecting quorums.
         pub const Membership = Core.Membership;
-        /// Caller-owned output buffers; sync writes before sending messages.
+        /// Caller-owned buffers; sync writes before durable-claim messages.
         pub const Effects = Core.Effects;
         /// One addressed protocol message from the fixed membership.
         pub const Envelope = Core.Envelope;
         /// Wire vocabulary of the core protocol, carrying `Entry` payloads.
         pub const Message = Core.Message;
-        /// One durable journal record; apply in order before sending messages.
+        /// One durable record; apply in order before publishing durable claims.
         pub const Write = Core.Write;
         /// Durable acceptor and learner state reconstructed by journal replay.
         pub const DurableState = Core.DurableState;

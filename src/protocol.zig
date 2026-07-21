@@ -258,7 +258,9 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             message: Message,
         };
 
-        /// A durable-state delta. Apply these records in order before sending messages.
+        /// A durable-state delta. Apply in order before publishing any message
+        /// that claims durable state. Hosts may pipeline only the narrow
+        /// request class returned by `Effects.preDurableMessages`.
         pub const Write = union(enum) {
             promise: Ballot,
             accept: struct {
@@ -318,8 +320,43 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 return self.writes[0..self.writes_count];
             }
 
-            /// Records that the host made every pending write durable (fsync).
-            /// Call after persisting `writesSlice` and before `messagesSlice`.
+            /// Whether this batch contains a promise or vote whose loss after
+            /// it is published could violate Paxos safety. Those records need
+            /// the host's strongest power-loss barrier. A commit-only batch is
+            /// different: the value was already chosen from durable quorum
+            /// evidence, so its local commit marker is reconstructible during
+            /// phase one. Hosts may omit that derived marker, or append it
+            /// without paying a second device-cache barrier.
+            pub fn requiresPowerLossBarrier(self: *const Effects) bool {
+                for (self.writesSlice()) |write| switch (write) {
+                    .promise, .accept => return true,
+                    .commit => {},
+                };
+                return false;
+            }
+
+            /// Returns an iterator over the narrow class of outbound messages
+            /// that a host may release while this transition's writes are
+            /// being synced.  Today that class contains only phase-two
+            /// `accept` requests: they ask remote acceptors to make a vote
+            /// durable but make no claim that the sender's own vote is
+            /// durable.  Promise streams and `accepted` replies remain behind
+            /// `confirmWritesDurable` because they do carry durable claims.
+            ///
+            /// A pipelining host must still serialize this node: it may not
+            /// feed a reply or start another transition until it has persisted
+            /// `writesSlice` and called `confirmWritesDurable`.  This lets a
+            /// leader overlap its local barrier with follower barriers without
+            /// counting volatile state toward a quorum.
+            pub fn preDurableMessages(self: *const Effects) PreDurableMessageIterator {
+                return .{ .messages = self.messages[0..self.messages_count] };
+            }
+
+            /// Records that the host satisfied the persistence contract for
+            /// every pending write. If `requiresPowerLossBarrier` is true this
+            /// means the strongest durable barrier; a commit-only batch may be
+            /// omitted or weakly persisted because it is derived from already
+            /// durable quorum evidence. Call before `messagesSlice`.
             pub fn confirmWritesDurable(self: *Effects) void {
                 self.writes_confirmed = true;
             }
@@ -332,6 +369,23 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 }
                 return self.messages[0..self.messages_count];
             }
+
+            pub const PreDurableMessageIterator = struct {
+                messages: []const Envelope,
+                index: usize = 0,
+
+                pub fn next(self: *PreDurableMessageIterator) ?Envelope {
+                    while (self.index < self.messages.len) {
+                        const envelope = self.messages[self.index];
+                        self.index += 1;
+                        switch (envelope.message) {
+                            .accept => return envelope,
+                            else => {},
+                        }
+                    }
+                    return null;
+                }
+            };
 
             /// Newly available contiguous application entries.
             pub fn committedSlice(self: *const Effects) []const Committed {
@@ -1872,6 +1926,63 @@ test "effects track durability confirmation for each write batch" {
     }, &unchecked_effects);
     try std.testing.expect(unchecked_effects.writes_count > 0);
     try std.testing.expect(unchecked_effects.messagesSlice().len > 0);
+}
+
+test "only accept requests are available before durability confirmation" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+
+    var leader: TestProtocol.Node = undefined;
+    try leader.init(1, &membership);
+    leader.role = .leader;
+    leader.ballot = .{ .round = 1, .node = 1 };
+    leader.durable.promised = leader.ballot;
+
+    var effects = TestProtocol.Effects{};
+    _ = try leader.propose(42, &effects);
+    try std.testing.expect(!effects.writes_confirmed);
+    try std.testing.expect(effects.requiresPowerLossBarrier());
+    var early = effects.preDurableMessages();
+    var accept_count: usize = 0;
+    while (early.next()) |envelope| {
+        try std.testing.expect(envelope.message == .accept);
+        accept_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), accept_count);
+
+    // A promise is evidence about an acceptor's durable state and must not
+    // be exposed through the pre-barrier class.
+    var follower: TestProtocol.Node = undefined;
+    try follower.init(2, &membership);
+    effects.confirmWritesDurable();
+    try follower.step(.{
+        .from = 1,
+        .to = 2,
+        .message = .{ .prepare = .{
+            .ballot = .{ .round = 2, .node = 1 },
+            .decided_through = 0,
+        } },
+    }, &effects);
+    var promises = effects.preDurableMessages();
+    try std.testing.expect(promises.next() == null);
+    try std.testing.expect(effects.requiresPowerLossBarrier());
+}
+
+test "commit-only effects are reconstructible derived state" {
+    var membership: TestProtocol.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var follower: TestProtocol.Node = undefined;
+    try follower.init(2, &membership);
+    var effects = TestProtocol.Effects{};
+
+    try follower.step(.{
+        .from = 1,
+        .to = 2,
+        .message = .{ .commit = .{ .slot = 1, .value = 99 } },
+    }, &effects);
+    try std.testing.expectEqual(@as(usize, 1), effects.writesSlice().len);
+    try std.testing.expect(!effects.requiresPowerLossBarrier());
+    try std.testing.expectEqual(@as(usize, 1), effects.committedSlice().len);
 }
 
 test "catch-up returns known commits from the requested slot" {
