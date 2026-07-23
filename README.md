@@ -234,4 +234,4 @@ side.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT © 2026 Vikrant Rathore and Ronak Rathore. See [LICENSE](LICENSE).
