@@ -33,7 +33,8 @@ publish_subtree docs zxdocs
 # exclude paths, so filter a throwaway clone and push its history.
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
-git clone --quiet "$(pwd)" "$workdir/paxos-zig"
+# --no-local: git-filter-repo refuses hardlinked local clones.
+git clone --quiet --no-local "$(pwd)" "$workdir/paxos-zig"
 (
     cd "$workdir/paxos-zig"
     git filter-repo --quiet --invert-paths --path zaxonlite --path docs
