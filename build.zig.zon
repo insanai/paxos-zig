@@ -4,18 +4,15 @@
     .fingerprint = 0xcde1e9b27d8c32ff, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
+    // Consumers only use the `paxos` module rooted at src/root.zig, so the
+    // package ships sources and metadata only. Examples, benchmarks, docs,
+    // and tools stay repository-only.
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        "examples",
-        "benchmarks",
-        "tools",
-        "docs/book.typ",
-        "docs/book",
-        "docs/features.md",
         "README.md",
-        "STYLE.md",
+        "CHANGELOG.md",
         "LICENSE",
     },
 }
