@@ -1,9 +1,8 @@
-# CI for the paxos-zig library.
+# CI for the paxos-zig library (insanai/paxos-zig).
 #
-# While this repository still hosts the monorepo, a second job also builds
-# and tests the zaxonlite subpackage. When zaxonlite moves to its own
-# repository (insanai/zaxonlite), delete the `zaxonlite` job here; the
-# split repository carries its own workflow.
+# The library is zero-dependency and does no I/O, so the pipeline is the
+# same three commands a contributor runs locally: style, tests with the
+# seeded fault simulation, and a longer simulation sweep.
 name: CI
 
 on:
@@ -19,8 +18,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  paxos:
-    name: paxos (${{ matrix.os }})
+  test:
+    name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -43,38 +42,3 @@ jobs:
       - name: Extended simulation sweep
         if: matrix.os == 'ubuntu-latest'
         run: zig build sim -- --seeds=512 --steps=1024
-
-  zaxonlite:
-    name: zaxonlite (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: zaxonlite
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      # macOS runners ship Homebrew openssl@3 at the build's default prefix.
-      - name: Install OpenSSL 3 (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
-
-      - name: Compile every binary
-        run: zig build check
-
-      - name: Unit and single-process integration tests
-        run: zig build test
-
-      - name: C ABI smoke test
-        run: zig build test-cabi
-
-      - name: CLI contract test
-        run: zig build test-cli
