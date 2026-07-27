@@ -5,9 +5,14 @@
 //!
 //! - fsync-each: one value proposed, every transition synced individually.
 //! - group8: eight values pipelined; each node buffers the group's writes
-//!   and messages, syncs once, then releases the messages. Buffering the
-//!   messages before the sync completes requires opting out of the debug
-//!   effect-order guard; the host still enforces the contract itself.
+//!   and messages, syncs once, then releases the messages.
+//!
+//! Both strategies copy writes and messages into host-owned batches and run
+//! the barrier outside `Effects`, so this host declares its protocol through
+//! `paxos.host_managed.Protocol` and owns the effect-order rule itself: the
+//! pending message queue stays private until the shared sync completes, and
+//! `verifyJournals` proves after every run that the written prefix rebuilds
+//! the live durable state.
 //!
 //! Numbers depend on the filesystem and disk; they are orders of magnitude
 //! above the in-memory results, which is the honest cost of durability.
@@ -20,10 +25,9 @@ const value_count = 512;
 const sample_count = 3;
 const record_size = 33;
 
-const P = paxos.Protocol(u64, .{
+const P = paxos.host_managed.Protocol(u64, .{
     .max_members = node_count,
     .max_slots = value_count,
-    .assert_effect_order = false,
 });
 
 const bench_dir = ".zig-cache/durable-bench";
