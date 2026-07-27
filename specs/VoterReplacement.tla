@@ -13,6 +13,7 @@
 (*   installed <-> CURRENT, the durable next-configuration state           *)
 (*   pointer   <-> REGISTRY, the active-registry pointer                   *)
 (*   identity  <-> the identity file's configuration_id                    *)
+(*   transport <-> the published peer generation                           *)
 (*   active    <-> the node sends and counts next-configuration votes      *)
 (*                                                                         *)
 (* Every variable is durable, so a crash-restart is a no-op and the        *)
@@ -31,24 +32,60 @@ Nodes == Survivors \cup {Removed, Replacement}
 
 NextMembers == Survivors \cup {Replacement}
 
-VARIABLES chosen, blob, installed, pointer, identity, active
+VARIABLES pending, submitted, chosen, ring, fence, blob, installed, pointer, identity,
+          transport, active
 
-vars == <<chosen, blob, installed, pointer, identity, active>>
+vars == <<pending, submitted, chosen, ring, fence, blob, installed, pointer, identity,
+          transport, active>>
 
 Init ==
+  /\ pending = "none"
+  /\ submitted = FALSE
   /\ chosen = FALSE
+  /\ ring = {}
+  /\ fence = Removed
   /\ blob = [n \in Nodes |-> FALSE]
   /\ installed = [n \in Nodes |-> FALSE]
   /\ pointer = [n \in Nodes |-> 1]
   /\ identity = [n \in Nodes |-> 1]
+  /\ transport = [n \in Nodes |-> 1]
   /\ active = [n \in Nodes |-> FALSE]
 
+(* The coordinator persists the exact request before checkpoint work.      *)
+Prepare ==
+  /\ pending = "none"
+  /\ pending' = "prepared"
+  /\ UNCHANGED <<submitted, chosen, ring, fence, blob, installed, pointer, identity,
+                 transport, active>>
+
+(* Durable Paxos submission precedes the proposed phase marker.            *)
+Submit ==
+  /\ pending = "prepared"
+  /\ submitted' = TRUE
+  /\ UNCHANGED <<pending, chosen, ring, fence, blob, installed, pointer, identity,
+                 transport, active>>
+
+(* A crash can leave submitted true, or even the stop chosen, while the    *)
+(* coordinator's file still says prepared. Recovery sees the durable        *)
+(* accepted stop and performs this idempotent phase repair.                 *)
+MarkProposed ==
+  /\ submitted
+  /\ pending = "prepared"
+  /\ pending' = "proposed"
+  /\ UNCHANGED <<submitted, chosen, ring, fence, blob, installed, pointer,
+                 identity, transport, active>>
+
 (* The sealed configuration's voters choose the stop sign binding the      *)
-(* checkpoint, the next member IDs, and the next-registry digest.          *)
+(* checkpoint, the next member IDs, and the next-registry digest. The      *)
+(* coordinator's scratch phase file is not part of the choice.             *)
 ChooseStop ==
   /\ ~chosen
+  /\ submitted
   /\ chosen' = TRUE
-  /\ UNCHANGED <<blob, installed, pointer, identity, active>>
+  /\ ring' = {42}
+  /\ fence' = Replacement
+  /\ UNCHANGED <<pending, submitted, blob, installed, pointer, identity,
+                 transport, active>>
 
 (* A survivor reconstructs the next registry deterministically from the    *)
 (* chosen stop metadata and stores the blob without the network.           *)
@@ -56,7 +93,8 @@ StoreBlob(n) ==
   /\ n \in Survivors
   /\ chosen
   /\ blob' = [blob EXCEPT ![n] = TRUE]
-  /\ UNCHANGED <<chosen, installed, pointer, identity, active>>
+  /\ UNCHANGED <<pending, submitted, chosen, ring, fence, installed, pointer, identity,
+                 transport, active>>
 
 (* The joining replacement fetches the blob from a member that already     *)
 (* activated the next configuration and verifies it against the digest     *)
@@ -65,7 +103,8 @@ FetchBlob ==
   /\ chosen
   /\ \E m \in Survivors : identity[m] = 2
   /\ blob' = [blob EXCEPT ![Replacement] = TRUE]
-  /\ UNCHANGED <<chosen, installed, pointer, identity, active>>
+  /\ UNCHANGED <<pending, submitted, chosen, ring, fence, installed, pointer, identity,
+                 transport, active>>
 
 (* CURRENT advances: a survivor materializes its own checkpoint; the       *)
 (* replacement installs the transferred snapshot only after its fetched    *)
@@ -75,7 +114,8 @@ InstallState(n) ==
   /\ chosen
   /\ (n = Replacement) => blob[n]
   /\ installed' = [installed EXCEPT ![n] = TRUE]
-  /\ UNCHANGED <<chosen, blob, pointer, identity, active>>
+  /\ UNCHANGED <<pending, submitted, chosen, ring, fence, blob, pointer, identity,
+                 transport, active>>
 
 (* REGISTRY advances after CURRENT and only over a stored blob.            *)
 FlipPointer(n) ==
@@ -83,14 +123,25 @@ FlipPointer(n) ==
   /\ installed[n]
   /\ blob[n]
   /\ pointer' = [pointer EXCEPT ![n] = 2]
-  /\ UNCHANGED <<chosen, blob, installed, identity, active>>
+  /\ UNCHANGED <<pending, submitted, chosen, ring, fence, blob, installed, identity,
+                 transport, active>>
 
 (* The identity file advances last; recovery on either side of it          *)
 (* converges through the same rollover path.                               *)
 AdvanceIdentity(n) ==
   /\ pointer[n] = 2
   /\ identity' = [identity EXCEPT ![n] = 2]
-  /\ UNCHANGED <<chosen, blob, installed, pointer, active>>
+  /\ UNCHANGED <<pending, submitted, chosen, ring, fence, blob, installed, pointer,
+                 transport, active>>
+
+(* The in-process server publishes the matching peer generation before it  *)
+(* enables any next-configuration Paxos traffic.                           *)
+SwapTransport(n) ==
+  /\ n \in NextMembers
+  /\ identity[n] = 2
+  /\ transport' = [transport EXCEPT ![n] = 2]
+  /\ UNCHANGED <<pending, submitted, chosen, ring, fence, blob, installed, pointer,
+                 identity, active>>
 
 (* Participation in the next configuration requires the whole durable      *)
 (* chain.  The removed voter has no activation action at all: admission    *)
@@ -99,10 +150,15 @@ AdvanceIdentity(n) ==
 Activate(n) ==
   /\ n \in NextMembers
   /\ identity[n] = 2
+  /\ transport[n] = 2
   /\ active' = [active EXCEPT ![n] = TRUE]
-  /\ UNCHANGED <<chosen, blob, installed, pointer, identity>>
+  /\ UNCHANGED <<pending, submitted, chosen, ring, fence, blob, installed, pointer,
+                 identity, transport>>
 
 Next ==
+  \/ Prepare
+  \/ Submit
+  \/ MarkProposed
   \/ ChooseStop
   \/ FetchBlob
   \/ \E n \in Nodes :
@@ -110,6 +166,7 @@ Next ==
        \/ InstallState(n)
        \/ FlipPointer(n)
        \/ AdvanceIdentity(n)
+       \/ SwapTransport(n)
        \/ Activate(n)
 
 Spec == Init /\ [][Next]_vars
@@ -135,16 +192,30 @@ IdentityFollowsPointer ==
 (* A replacement cannot vote before its durable verified installation.     *)
 NoActivationBeforeInstall ==
   \A n \in Nodes :
-    active[n] => (installed[n] /\ pointer[n] = 2 /\ identity[n] = 2)
+    active[n] => (installed[n] /\ pointer[n] = 2 /\ identity[n] = 2 /\
+                  transport[n] = 2)
 
 (* The removed voter stays permanently sealed on its final configuration. *)
 RemovedStaysSealed ==
   /\ ~active[Removed]
   /\ identity[Removed] = 1
   /\ pointer[Removed] = 1
+  /\ transport[Removed] = 1
 
 (* The replacement's state, when present, came through the verified fetch. *)
 ReplacementFetchesFirst ==
   installed[Replacement] => blob[Replacement]
+
+(* The chosen operation advances both bounded identity authorities.        *)
+ChoiceAdvancesFences ==
+  chosen => (ring = {42} /\ fence = Replacement)
+
+(* Scratch state cannot claim proposal submission before preparation, and  *)
+(* nothing is chosen without a durable submission. The chosen stop may     *)
+(* outrun the coordinator's phase file; MarkProposed repairs that gap.     *)
+PendingPhaseIsSound ==
+  /\ pending \in {"none", "prepared", "proposed"}
+  /\ (submitted => pending # "none")
+  /\ (chosen => submitted)
 
 =============================================================================

@@ -80,7 +80,7 @@ fn runMode(io: std.Io, name: []const u8, window: u32) !void {
     const per_value = @as(f64, @floatFromInt(median.nanoseconds)) /
         @as(f64, @floatFromInt(value_count));
     std.debug.print(
-        \\workload:       durable-u64-3n mode={s} (Zig Multi-Paxos 0.1.0)
+        \\workload:       durable-u64-3n mode={s} (Zig Multi-Paxos {s})
         \\values:         {d} nodes={d} journal=file-per-node fsync-before-send
         \\median_ns:      {d}
         \\range_ns:       {d}..{d} across {d} samples
@@ -89,11 +89,12 @@ fn runMode(io: std.Io, name: []const u8, window: u32) !void {
         \\checksum:       {d}
         \\
     , .{
-        name,                   value_count,
-        node_count,             median.nanoseconds,
-        samples[0].nanoseconds, samples[sample_count - 1].nanoseconds,
-        sample_count,           per_value,
-        median.fsyncs,          median.checksum,
+        name,                                  paxos.version,
+        value_count,                           node_count,
+        median.nanoseconds,                    samples[0].nanoseconds,
+        samples[sample_count - 1].nanoseconds, sample_count,
+        per_value,                             median.fsyncs,
+        median.checksum,
     });
     std.debug.print(
         "{{\"impl\":\"paxos-zig\",\"workload\":\"durable-u64-3n\"," ++

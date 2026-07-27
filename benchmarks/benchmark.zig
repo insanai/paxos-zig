@@ -306,7 +306,7 @@ fn Bench(
             const per_value = @as(f64, @floatFromInt(median.nanoseconds)) /
                 @as(f64, @floatFromInt(measured_values));
             std.debug.print(
-                \\workload:       {s} mode={s} (Zig Multi-Paxos 0.1.0)
+                \\workload:       {s} mode={s} (Zig Multi-Paxos {s})
                 \\values:         {d} ({d} x {d} iterations) nodes={d} payload={d}B max_slots={d}
                 \\median_ns:      {d} (min {d}, max {d} across {d} samples)
                 \\ns_per_value:   {d:.2}
@@ -316,15 +316,16 @@ fn Bench(
                 \\checksum:       {d}
                 \\
             , .{
-                workload,                              mode.name,
-                measured_values,                       value_count,
-                measurement_iterations,                node_count,
-                @sizeOf(ValueT),                       max_slots,
-                median.nanoseconds,                    samples[0].nanoseconds,
-                samples[sample_count - 1].nanoseconds, sample_count,
-                per_value,                             window_ns_per_value[0],
-                window_ns_per_value[1],                window_ns_per_value[2],
-                window_ns_per_value[3],                median.messages,
+                workload,               mode.name,
+                paxos.version,          measured_values,
+                value_count,            measurement_iterations,
+                node_count,             @sizeOf(ValueT),
+                max_slots,              median.nanoseconds,
+                samples[0].nanoseconds, samples[sample_count - 1].nanoseconds,
+                sample_count,           per_value,
+                window_ns_per_value[0], window_ns_per_value[1],
+                window_ns_per_value[2], window_ns_per_value[3],
+                median.messages,
                 @as(f64, @floatFromInt(median.messages)) /
                     @as(f64, @floatFromInt(measured_values)),
                 median.checksum,

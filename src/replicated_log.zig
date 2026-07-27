@@ -413,6 +413,30 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 return self.stop_slot;
             }
 
+            /// Returns the undecided stop value retained in durable accepted
+            /// state or volatile leader proposals. Used by a host to repair
+            /// its own durable operation phase after a crash.
+            pub fn pendingStopSign(self: *const Node) ?StopSign {
+                if (self.stop_sign) |stop| return stop;
+                for (self.core.durable.accepted, 0..) |accepted, index| {
+                    if (self.core.durable.committed[index] != null) continue;
+                    const entry = accepted orelse continue;
+                    switch (entry.value) {
+                        .command => {},
+                        .stop => |stop| return stop,
+                    }
+                }
+                for (self.core.proposals, 0..) |proposal, index| {
+                    if (self.core.durable.committed[index] != null) continue;
+                    const entry = proposal orelse continue;
+                    switch (entry) {
+                        .command => {},
+                        .stop => |stop| return stop,
+                    }
+                }
+                return null;
+            }
+
             fn recalculateStopPending(self: *Node) void {
                 if (self.stop_sign != null) {
                     self.stop_pending = true;

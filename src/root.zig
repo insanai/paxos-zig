@@ -11,6 +11,8 @@ const protocol = @import("protocol.zig");
 const replicated_log = @import("replicated_log.zig");
 const learner = @import("learner.zig");
 
+/// Human-readable library version.
+pub const version = "0.1.2";
 /// Stable identity of one voting member.
 pub const NodeId = protocol.NodeId;
 /// One-based log position.

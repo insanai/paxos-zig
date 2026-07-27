@@ -82,23 +82,26 @@ decided one-for-one voter replacement (ZDS 0008). It does not re-prove
 consensus: the sealed configuration's unique stop-sign choice is
 `Paxos.tla`'s job and appears here as the single atomic `ChooseStop`
 action. What it checks is the host's durable activation discipline around
-that choice. Every variable models a durable file, so a crash-restart is
-a no-op and the in-process transport swap is behaviorally identical to a
-restart; TLC explores every crash interleaving as an ordinary action
-prefix.
+that choice. Durable variables survive a crash. The transport generation
+does not. TLC explores crash points as action prefixes and requires
+transport publication before next-configuration activation.
 
 ## Action-to-code mapping
 
 | Spec action       | zaxonlite code                                        |
 | ----------------- | ----------------------------------------------------- |
-| `ChooseStop`      | `Node.prepareReplacement` -> chosen stop sign         |
+| `Prepare`         | durable `PENDING-OP` prepared record                  |
+| `Submit`          | `ReplicatedLog.reconfigure` and durable effects       |
+| `MarkProposed`    | pending-record crash repair / proposed record         |
+| `ChooseStop`      | chosen stop sign and decided operation record         |
 | `StoreBlob`       | `registry.storeBlob` in `completeRollover`            |
 |                   | (deterministic reconstruction from zx2 metadata)      |
 | `FetchBlob`       | `registry_request`/`registry_data` during install     |
 | `InstallState`    | `completeRollover` CURRENT write / `installSnapshot`  |
 | `FlipPointer`     | `registry.activatePointer` (the REGISTRY file)        |
 | `AdvanceIdentity` | `writeIdentity`                                       |
-| `Activate`        | transport swap / replacement activation               |
+| `SwapTransport`   | `Server.rebuildTransport` generation publication     |
+| `Activate`        | `Node.activateRollover` / replacement activation      |
 
 Checked invariants: `NothingBeforeChoice` (no durable next-configuration
 state before consensus chose it), `PointerNeverDangles` (the REGISTRY
@@ -106,15 +109,21 @@ pointer names a stored, installed generation), `IdentityFollowsPointer`
 (recovery never mixes configurations), `NoActivationBeforeInstall` (a
 replacement cannot vote before durable verified installation),
 `RemovedStaysSealed`, and `ReplacementFetchesFirst`.
+`ChoiceAdvancesFences` binds the decided operation ring and node-ID fence.
+`PendingPhaseIsSound` checks the durable submission phase: nothing is
+chosen without a durable submission, and the chosen stop may outrun the
+coordinator's phase file until `MarkProposed` repairs it on recovery.
 
-Verified 28 July 2026 with TLC (tla2tools v1.6.0, Java 8): complete
-search, 1,788 states generated, 170 distinct states, depth 17, no
-violation, in about one second:
+Run the complete state-space check with:
 
 ```sh
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 4 \
     VoterReplacement.tla
 ```
+
+Verified 28 July 2026 with TLC (tla2tools 2.14, Java 8): complete
+search, 7,995 states generated, 600 distinct states, depth 23, no
+violation, in about one second.
 
 The invariants are not vacuous: deliberately removing the
 CURRENT-before-REGISTRY guard from `FlipPointer` makes TLC report a
