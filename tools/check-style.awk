@@ -6,7 +6,8 @@ function count_char(text, character, copy) {
 function finish_function(end_line, line_count, name) {
     name = function_name[function_count]
     line_count = end_line - function_start[function_count] + 1
-    if (name != "Protocol" && name != "ReplicatedLog" && name != "Learner" && \
+    if (name != "Protocol" && name != "ProtocolGated" && name != "ReplicatedLog" && \
+        name != "Learner" && \
         name != "Simulator" && name != "Bench" && FILENAME !~ /cli_test\.zig$/ && \
         FILENAME !~ /cluster_bench\.zig$/ && FILENAME !~ /cluster_test\.zig$/ && \
         FILENAME !~ /fuzz\.zig$/ && FILENAME !~ /main\.zig$/ && FILENAME !~ /node\.zig$/ && \

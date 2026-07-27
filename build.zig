@@ -11,6 +11,9 @@ pub fn build(b: *std.Build) void {
 
     addExample(b, target, optimize, paxos);
     const test_step = addTests(b, paxos);
+    addMisuseTests(b, target, test_step);
+    addCompileErrorTests(b, target, test_step);
+    addIntegrationTests(b, test_step);
     addSimulation(b, target, optimize, paxos, test_step);
     addApiDocs(b, paxos);
     addBenchmarks(b, target);
@@ -241,6 +244,221 @@ fn addTests(b: *std.Build, paxos: *std.Build.Module) *std.Build.Step {
     return test_step;
 }
 
+/// Effect-order misuse fixtures run as child processes in every optimize
+/// mode. A violation must abort with its stable diagnostic on stderr even
+/// in ReleaseFast and ReleaseSmall; the correct sequence must exit cleanly.
+fn addMisuseTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    test_step: *std.Build.Step,
+) void {
+    const step = b.step(
+        "test-misuse",
+        "Verify effect-order misuse stops the process in every optimize mode",
+    );
+    const cases = [_]struct {
+        src: []const u8,
+        name: []const u8,
+        diagnostic: ?[]const u8,
+    }{
+        .{
+            .src = "tests/misuse/messages_before_confirm.zig",
+            .name = "messages-before-confirm",
+            .diagnostic = "paxos: messagesSlice before confirmWritesDurable",
+        },
+        .{
+            .src = "tests/misuse/reset_unconfirmed.zig",
+            .name = "reset-unconfirmed",
+            .diagnostic = "paxos: reset discarded unconfirmed writes",
+        },
+        .{
+            .src = "tests/misuse/correct_order.zig",
+            .name = "correct-order",
+            .diagnostic = null,
+        },
+    };
+    const modes = [_]std.builtin.OptimizeMode{
+        .Debug, .ReleaseSafe, .ReleaseFast, .ReleaseSmall,
+    };
+    for (modes) |mode| {
+        const paxos = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = mode,
+        });
+        for (cases) |case| {
+            const exe = b.addExecutable(.{
+                .name = b.fmt("paxos-misuse-{s}-{t}", .{ case.name, mode }),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(case.src),
+                    .target = target,
+                    .optimize = mode,
+                    .imports = &.{.{ .name = "paxos", .module = paxos }},
+                }),
+            });
+            const run = b.addRunArtifact(exe);
+            if (case.diagnostic) |diagnostic| {
+                run.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+                run.expectStdErrMatch(diagnostic);
+            } else {
+                run.expectExitCode(0);
+            }
+            step.dependOn(&run.step);
+        }
+    }
+    test_step.dependOn(step);
+}
+
+/// Fixtures whose compilation must fail with the paired stable message.
+const compile_fail_cases = [_]struct { src: []const u8, expected: []const u8 }{
+    .{
+        .src = "tests/compile_fail/protocol_zero_max_members.zig",
+        .expected = "error: paxos Protocol option max_members must be greater than zero",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_zero_max_slots.zig",
+        .expected = "error: paxos Protocol option max_slots must be greater than zero",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_max_members_too_large.zig",
+        .expected = "error: paxos Protocol option max_members must be at most 65535",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_max_slots_too_large.zig",
+        .expected = "error: paxos Protocol option max_slots must be at most 4294967295",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_zero_election_timeout.zig",
+        .expected = "error: paxos Protocol option election_timeout_ticks " ++
+            "must be greater than zero",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_zero_heartbeat_interval.zig",
+        .expected = "error: paxos Protocol option heartbeat_interval_ticks " ++
+            "must be greater than zero",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_zero_resend_interval.zig",
+        .expected = "error: paxos Protocol option resend_interval_ticks " ++
+            "must be greater than zero",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_pointer_value.zig",
+        .expected = "error: Value type '*u64' must not contain pointers, " ++
+            "slices, or references.",
+    },
+    .{
+        .src = "tests/compile_fail/replicated_log_zero_max_batch.zig",
+        .expected = "error: paxos ReplicatedLog option max_batch must be greater than zero",
+    },
+    .{
+        .src = "tests/compile_fail/replicated_log_batch_exceeds_entries.zig",
+        .expected = "error: paxos ReplicatedLog option max_batch must not exceed max_entries",
+    },
+    .{
+        .src = "tests/compile_fail/replicated_log_metadata_too_large.zig",
+        .expected = "error: paxos ReplicatedLog option max_metadata_bytes " ++
+            "must be at most 65535",
+    },
+    .{
+        .src = "tests/compile_fail/learner_zero_max_entries.zig",
+        .expected = "error: paxos Learner option max_entries must be greater than zero",
+    },
+};
+
+/// Invalid compile-time options must fail compilation with their stable
+/// identifying message. Each fixture succeeds only when the compiler
+/// rejects it with the expected error.
+fn addCompileErrorTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    test_step: *std.Build.Step,
+) void {
+    const step = b.step(
+        "test-compile-errors",
+        "Verify invalid comptime options fail with stable messages",
+    );
+    for (compile_fail_cases, 0..) |case, index| {
+        const name = b.fmt("paxos-compile-fail-{d}", .{index});
+        addCompileFailCase(b, step, target, name, case.src, "paxos", "src/root.zig", case.expected);
+    }
+
+    // The BitSet factory is internal, so its fixture imports the file directly.
+    addCompileFailCase(
+        b,
+        step,
+        target,
+        "paxos-compile-fail-bit-set",
+        "tests/compile_fail/bit_set_zero_bits.zig",
+        "bitset",
+        "src/bit_set.zig",
+        "error: paxos BitSet bit_count must be greater than zero",
+    );
+
+    // The derived-capacity overflow is only reachable where usize is 32 bits,
+    // so this fixture compiles for a 32-bit freestanding target.
+    const overflow_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    addCompileFailCase(
+        b,
+        step,
+        overflow_target,
+        "paxos-compile-fail-capacity-overflow",
+        "tests/compile_fail/protocol_capacity_overflow.zig",
+        "paxos",
+        "src/root.zig",
+        "error: paxos Protocol options max_members and max_slots " ++
+            "overflow the derived message capacity",
+    );
+
+    test_step.dependOn(step);
+}
+
+fn addCompileFailCase(
+    b: *std.Build,
+    step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    name: []const u8,
+    src: []const u8,
+    import_name: []const u8,
+    import_root: []const u8,
+    expected: []const u8,
+) void {
+    const object = b.addObject(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = target,
+            .optimize = .Debug,
+            .imports = &.{.{
+                .name = import_name,
+                .module = b.createModule(.{
+                    .root_source_file = b.path(import_root),
+                    .target = target,
+                    .optimize = .Debug,
+                }),
+            }},
+        }),
+    });
+    object.expect_errors = .{ .contains = expected };
+    step.dependOn(&object.step);
+}
+
+/// The path-dependency consumer proves the published package surface still
+/// resolves and compiles for a downstream `zig fetch` user.
+fn addIntegrationTests(b: *std.Build, test_step: *std.Build.Step) void {
+    const consumer = b.addSystemCommand(&.{ "zig", "build", "test" });
+    consumer.setCwd(b.path("integration/consumer"));
+    const step = b.step(
+        "test-integration",
+        "Run the path-dependency consumer smoke test",
+    );
+    step.dependOn(&consumer.step);
+    test_step.dependOn(step);
+}
+
 fn addSimulation(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -365,7 +583,7 @@ fn addBenchmarks(b: *std.Build, target: std.Build.ResolvedTarget) void {
 
 fn addFormatting(b: *std.Build) void {
     const fmt = b.addFmt(.{
-        .paths = &.{ "build.zig", "src", "examples", "benchmarks", "sim", "tools" },
+        .paths = &.{ "build.zig", "src", "examples", "benchmarks", "sim", "tests", "tools" },
         .check = true,
     });
     const style = b.addSystemCommand(&.{ "sh", "tools/check-style.sh" });
