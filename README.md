@@ -41,8 +41,9 @@ There is one rule, and everything depends on it:
 
 If you keep that rule, the protocol keeps its promise: no two nodes ever
 commit different values for the same slot, even under crashes, loss,
-duplication, delay, and reordering. Debug builds assert the rule. If you
-break it, the library stops you before the network does worse.
+duplication, delay, and reordering. Every build mode enforces the rule,
+including ReleaseFast and ReleaseSmall. If you break it, the library stops
+the process with a named diagnostic before the network does worse.
 
 Because there is no I/O, everything is deterministic. Because everything is
 deterministic, we can simulate thousands of terrible networks and replay any
@@ -147,6 +148,12 @@ For membership changes and snapshot epochs, use
 `paxos.ReplicatedLog(Command, options)`. Its `reconfigure` seals the old
 configuration with an ordered stop sign, `checkpoint` seals an epoch with
 snapshot metadata, and `initFromStop` starts the next configuration.
+
+Hosts that batch several transitions behind one shared storage barrier can
+declare their protocol through `paxos.host_managed.Protocol` instead. That
+namespace disables the runtime ordering check and transfers the safety
+obligation to the host; its doc comment lists the four rules such a host
+must keep, and every use should be treated as an audited exception.
 
 The full host-integration contract, recovery rules, and API reference live in
 the book (see [insanai/zxdocs](https://github.com/insanai/zxdocs)) and in the

@@ -6,6 +6,9 @@
 
 - [ ] `zig build fmt` passes (zig fmt plus the style checker).
 - [ ] `zig build test` passes (unit tests plus the seeded fault simulation).
+- [ ] The effect-order misuse matrix passes in all four optimize modes and
+      the compile-fail fixtures still reject invalid options
+      (`zig build test-misuse test-compile-errors`, included in `test`).
 - [ ] The write-before-send rule is untouched: no message that acknowledges a
       promise, acceptance, or commit is emitted before its durable record.
 - [ ] Protocol changes add a test that explains the failure schedule being
