@@ -50,15 +50,29 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
         metadata: [options.max_metadata_bytes]u8,
         metadata_count: u16,
 
-        fn create(
+        /// Validates a next-configuration member list: nonempty, within the
+        /// compile-time bound, and free of zero or duplicate IDs. Hosts that
+        /// decode stop signs from their own wire formats reuse this check.
+        pub fn validateMembers(members: []const protocol.NodeId) !void {
+            if (members.len == 0) return error.EmptyMembership;
+            if (members.len > options.max_members) return error.TooManyMembers;
+            for (members, 0..) |member, index| {
+                if (member == 0) return error.InvalidNodeId;
+                for (members[0..index]) |previous| {
+                    if (previous == member) return error.DuplicateNodeId;
+                }
+            }
+        }
+
+        /// Builds a validated stop sign for the named next configuration.
+        pub fn create(
             configuration_id: u64,
             members: []const protocol.NodeId,
             metadata: []const u8,
         ) !@This() {
             if (configuration_id == 0) return error.InvalidConfigurationId;
-            if (members.len == 0) return error.EmptyMembership;
-            if (members.len > options.max_members) return error.TooManyMembers;
             if (metadata.len > options.max_metadata_bytes) return error.MetadataTooLarge;
+            try validateMembers(members);
 
             var result = @This(){
                 .configuration_id = configuration_id,
@@ -67,13 +81,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 .metadata = [_]u8{0} ** options.max_metadata_bytes,
                 .metadata_count = @intCast(metadata.len),
             };
-            for (members, 0..) |member, index| {
-                if (member == 0) return error.InvalidNodeId;
-                for (members[0..index]) |previous| {
-                    if (previous == member) return error.DuplicateNodeId;
-                }
-                result.members[index] = member;
-            }
+            @memcpy(result.members[0..members.len], members);
             @memcpy(result.metadata[0..metadata.len], metadata);
             return result;
         }
@@ -132,6 +140,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             core: Core.Node,
             configuration_id: u64,
             stop_sign: ?StopSign = null,
+            stop_slot: protocol.Slot = 0,
             stop_pending: bool = false,
             batch_entries: [options.max_batch]Entry = undefined,
 
@@ -157,6 +166,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 try self.core.initWithPriority(id, membership, leader_priority);
                 self.configuration_id = configuration_id;
                 self.stop_sign = null;
+                self.stop_slot = 0;
                 self.stop_pending = false;
             }
 
@@ -171,6 +181,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 try self.core.initLearner(id, membership);
                 self.configuration_id = configuration_id;
                 self.stop_sign = null;
+                self.stop_slot = 0;
                 self.stop_pending = false;
             }
 
@@ -208,6 +219,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 try self.core.restoreWithPriority(id, membership, durable, leader_priority);
                 self.configuration_id = configuration_id;
                 self.stop_sign = null;
+                self.stop_slot = 0;
                 self.stop_pending = false;
                 self.observeDurable();
             }
@@ -224,6 +236,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 try self.core.restoreLearner(id, membership, durable);
                 self.configuration_id = configuration_id;
                 self.stop_sign = null;
+                self.stop_slot = 0;
                 self.stop_pending = false;
                 self.observeDurable();
             }
@@ -385,6 +398,21 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 return self.stop_sign;
             }
 
+            /// Returns the decided stop sign without copying it. The pointer
+            /// borrows this node and is invalidated by the next transition.
+            pub fn stopSign(self: *const Node) ?*const StopSign {
+                if (self.stop_sign) |*stop| return stop;
+                return null;
+            }
+
+            /// Returns the slot the decided stop sign occupies, if any. This
+            /// is the sealed configuration's final slot; the checkpoint the
+            /// host binds to the handover covers every slot before it.
+            pub fn stopSlot(self: *const Node) ?protocol.Slot {
+                if (self.stop_sign == null) return null;
+                return self.stop_slot;
+            }
+
             fn recalculateStopPending(self: *Node) void {
                 if (self.stop_sign != null) {
                     self.stop_pending = true;
@@ -424,6 +452,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                         .command => {},
                         .stop => |stop| {
                             self.stop_sign = stop;
+                            self.stop_slot = committed.slot;
                         },
                     }
                 }
@@ -431,12 +460,13 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             }
 
             fn observeDurable(self: *Node) void {
-                for (self.core.durable.committed) |committed| {
+                for (self.core.durable.committed, 0..) |committed, index| {
                     const entry = committed orelse continue;
                     switch (entry) {
                         .command => {},
                         .stop => |stop| {
                             self.stop_sign = stop;
+                            self.stop_slot = @intCast(index + 1);
                         },
                     }
                 }
@@ -469,6 +499,105 @@ test "a decided stop sign seals a configuration" {
     try std.testing.expectEqual(@as(u64, 8), stop.configuration_id);
     try std.testing.expectEqualStrings("snapshot:19", stop.metadataSlice());
     try std.testing.expectError(error.LogSealed, node.append(42, &effects));
+}
+
+test "a decided stop sign starts a changed-member configuration" {
+    const Log = ReplicatedLog(u64, .{
+        .max_members = 3,
+        .max_entries = 4,
+        .max_batch = 2,
+        .max_metadata_bytes = 16,
+    });
+    var membership: Log.Membership = undefined;
+    try membership.init(&.{1});
+    var node: Log.Node = undefined;
+    try node.init(1, 7, &membership);
+    node.core.role = .leader;
+    node.core.ballot = .{ .round = 1, .node = 1 };
+    var effects = Log.Effects{};
+
+    _ = try node.append(41, &effects);
+    effects.confirmWritesDurable();
+    const seal_slot = try node.reconfigure(8, &.{ 2, 3, 4 }, "handover:8", &effects);
+    effects.confirmWritesDurable();
+
+    const stop = node.stopSign().?;
+    try std.testing.expectEqual(@as(u64, 8), stop.configuration_id);
+    try std.testing.expectEqualSlices(
+        protocol.NodeId,
+        &.{ 2, 3, 4 },
+        stop.membersSlice(),
+    );
+    try std.testing.expectEqual(seal_slot, node.stopSlot().?);
+
+    // A surviving or fresh member starts the next configuration.
+    var next_membership: Log.Membership = undefined;
+    var next: Log.Node = undefined;
+    try next.initFromStop(4, stop, &next_membership, 0);
+    try std.testing.expectEqual(@as(u64, 8), next.configurationId());
+    try std.testing.expectEqual(@as(?protocol.Slot, null), next.stopSlot());
+
+    // The departed member cannot join the configuration that removed it.
+    var removed_membership: Log.Membership = undefined;
+    var removed: Log.Node = undefined;
+    try std.testing.expectError(
+        error.NotMember,
+        removed.initFromStop(1, stop, &removed_membership, 0),
+    );
+}
+
+test "restore recovers the decided stop slot" {
+    const Log = ReplicatedLog(u64, .{
+        .max_members = 3,
+        .max_entries = 4,
+        .max_batch = 2,
+        .max_metadata_bytes = 16,
+    });
+    var membership: Log.Membership = undefined;
+    try membership.init(&.{1});
+    var node: Log.Node = undefined;
+    try node.init(1, 7, &membership);
+    node.core.role = .leader;
+    node.core.ballot = .{ .round = 1, .node = 1 };
+    var effects = Log.Effects{};
+
+    var durable = Log.DurableState{};
+    _ = try node.append(41, &effects);
+    for (effects.writesSlice()) |write| try durable.apply(write);
+    effects.confirmWritesDurable();
+    const seal_slot = try node.reconfigure(8, &.{ 1, 2, 4 }, "handover", &effects);
+    for (effects.writesSlice()) |write| try durable.apply(write);
+    effects.confirmWritesDurable();
+
+    var restored: Log.Node = undefined;
+    try restored.restore(1, 7, &membership, &durable);
+    try std.testing.expectEqual(seal_slot, restored.stopSlot().?);
+    try std.testing.expectEqual(@as(u64, 8), restored.stopSign().?.configuration_id);
+}
+
+test "stop sign member validation is reusable by host decoders" {
+    const Log = ReplicatedLog(u64, .{
+        .max_members = 3,
+        .max_entries = 4,
+        .max_batch = 2,
+    });
+    try Log.StopSign.validateMembers(&.{ 1, 2, 3 });
+    try std.testing.expectError(
+        error.EmptyMembership,
+        Log.StopSign.validateMembers(&.{}),
+    );
+    try std.testing.expectError(
+        error.TooManyMembers,
+        Log.StopSign.validateMembers(&.{ 1, 2, 3, 4 }),
+    );
+    try std.testing.expectError(
+        error.InvalidNodeId,
+        Log.StopSign.validateMembers(&.{ 1, 0, 3 }),
+    );
+    try std.testing.expectError(
+        error.DuplicateNodeId,
+        Log.StopSign.validateMembers(&.{ 1, 2, 1 }),
+    );
 }
 
 test "replicated log batches commands without allocation" {

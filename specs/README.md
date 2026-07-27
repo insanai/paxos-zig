@@ -74,3 +74,48 @@ enablement and the write family in `Decide`.
 This is a model of the design, not a mechanical refinement of the Zig
 code; the conformance appendix in the book records the mapping and its
 limits.
+
+## VoterReplacement.tla
+
+`VoterReplacement.tla` is the bounded host-level model for zaxonlite's
+decided one-for-one voter replacement (ZDS 0008). It does not re-prove
+consensus: the sealed configuration's unique stop-sign choice is
+`Paxos.tla`'s job and appears here as the single atomic `ChooseStop`
+action. What it checks is the host's durable activation discipline around
+that choice. Every variable models a durable file, so a crash-restart is
+a no-op and the in-process transport swap is behaviorally identical to a
+restart; TLC explores every crash interleaving as an ordinary action
+prefix.
+
+## Action-to-code mapping
+
+| Spec action       | zaxonlite code                                        |
+| ----------------- | ----------------------------------------------------- |
+| `ChooseStop`      | `Node.prepareReplacement` -> chosen stop sign         |
+| `StoreBlob`       | `registry.storeBlob` in `completeRollover`            |
+|                   | (deterministic reconstruction from zx2 metadata)      |
+| `FetchBlob`       | `registry_request`/`registry_data` during install     |
+| `InstallState`    | `completeRollover` CURRENT write / `installSnapshot`  |
+| `FlipPointer`     | `registry.activatePointer` (the REGISTRY file)        |
+| `AdvanceIdentity` | `writeIdentity`                                       |
+| `Activate`        | transport swap / replacement activation               |
+
+Checked invariants: `NothingBeforeChoice` (no durable next-configuration
+state before consensus chose it), `PointerNeverDangles` (the REGISTRY
+pointer names a stored, installed generation), `IdentityFollowsPointer`
+(recovery never mixes configurations), `NoActivationBeforeInstall` (a
+replacement cannot vote before durable verified installation),
+`RemovedStaysSealed`, and `ReplacementFetchesFirst`.
+
+Verified 28 July 2026 with TLC (tla2tools v1.6.0, Java 8): complete
+search, 1,788 states generated, 170 distinct states, depth 17, no
+violation, in about one second:
+
+```sh
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 4 \
+    VoterReplacement.tla
+```
+
+The invariants are not vacuous: deliberately removing the
+CURRENT-before-REGISTRY guard from `FlipPointer` makes TLC report a
+`PointerNeverDangles` violation immediately.

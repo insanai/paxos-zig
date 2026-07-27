@@ -391,6 +391,23 @@ const Cluster = struct {
         }
     }
 
+    /// Oracle: every node reports the same decided stop slot through the
+    /// library accessor the host binds into its checkpoint proof.
+    fn expectStopSlotAgreement(self: *Cluster, seal_slot: paxos.Slot) !void {
+        for (0..node_count) |index| {
+            const slot = self.nodes[index].stopSlot() orelse {
+                return self.fail("node {d} reports no stop slot", .{self.ids[index]});
+            };
+            if (slot != seal_slot) {
+                return self.fail("node {d} reports stop slot {d}, expected {d}", .{
+                    self.ids[index],
+                    slot,
+                    seal_slot,
+                });
+            }
+        }
+    }
+
     fn fail(self: *const Cluster, comptime reason: []const u8, args: anytype) anyerror {
         std.debug.print(
             "reconfiguration failure: " ++ reason ++ "\n  seed={d}\n",
@@ -478,6 +495,73 @@ fn runMembershipChangeScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u6
     try next_epoch.expectEpochDecides(2, &.{21});
 }
 
+/// Seals via `reconfigure` into a one-for-one voter replacement (1,2,3 ->
+/// 1,2,4), the schedule zaxonlite's replacement operation drives. The leader
+/// varies by seed, one seal accept is dropped and one duplicated, survivors
+/// hand over without the removed voter, and the removed voter can neither
+/// join the next configuration nor reopen the sealed one.
+fn runVoterReplacementScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u64) !void {
+    try cluster.init(seed, 1, .{ 1, 2, 3 });
+    const leader_index: usize = @intCast(seed % node_count);
+    try cluster.elect(leader_index);
+    _ = try cluster.appendAt(leader_index, 31);
+    _ = try cluster.appendAt(leader_index, 32);
+    try cluster.drainShuffled();
+
+    const seal_slot = cluster.nodes[leader_index].reconfigure(
+        2,
+        &.{ 1, 2, 4 },
+        "replace:3->4",
+        &cluster.effects[leader_index],
+    ) catch |err| return cluster.fail("reconfigure returned {t}", .{err});
+    try cluster.applyEffects(leader_index);
+
+    // Adverse schedule around the seal: one follower loses its seal accept
+    // and must learn the seal from the commit alone; the other follower
+    // votes on a duplicate.
+    var followers: [2]paxos.NodeId = undefined;
+    var follower_count: usize = 0;
+    for (cluster.ids) |id| {
+        if (id == cluster.ids[leader_index]) continue;
+        followers[follower_count] = id;
+        follower_count += 1;
+    }
+    try cluster.dropAccept(seal_slot, followers[0]);
+    try cluster.duplicateAccept(seal_slot, followers[1]);
+    try cluster.drainShuffled();
+    try cluster.settle(settle_rounds);
+
+    try cluster.expectSealAgreement(seal_slot, 2, &.{ 1, 2, 4 }, "replace:3->4");
+    try cluster.expectStopSlotAgreement(seal_slot);
+    try cluster.expectNothingAfterSeal(seal_slot);
+    try cluster.expectDuplicateSealCommitIsIdempotent(seal_slot);
+    for (0..node_count) |index| {
+        try cluster.expectReplayPreservesSeal(index, 1, 2);
+    }
+
+    const stop = cluster.nodes[leader_index].isReconfigured().?;
+
+    // The removed voter is not a member of the next configuration and its
+    // join attempt is rejected at initialization.
+    var removed_membership: Log.Membership = undefined;
+    var removed: Log.Node = undefined;
+    if (removed.initFromStop(3, &stop, &removed_membership, 0)) |_| {
+        return cluster.fail("removed voter joined the next configuration", .{});
+    } else |err| if (err != error.NotMember) {
+        return cluster.fail("removed voter join returned {t}", .{err});
+    }
+
+    // Survivors 1 and 2 plus fresh voter 4 elect a leader (varying by seed)
+    // and decide without the removed voter.
+    try next_epoch.initFromStop(seed, &stop);
+    const next_leader: usize = @intCast((seed / node_count) % node_count);
+    try next_epoch.elect(next_leader);
+    _ = try next_epoch.appendAt(next_leader, 41);
+    _ = try next_epoch.appendAt(next_leader, 42);
+    try next_epoch.drainShuffled();
+    try next_epoch.expectEpochDecides(2, &.{ 41, 42 });
+}
+
 test "reconfiguration: checkpoint seal survives drop, duplicate, and reorder" {
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
@@ -497,5 +581,16 @@ test "reconfiguration: membership handover reaches the new configuration" {
     var seed: u64 = 1;
     while (seed <= scenario_seeds) : (seed += 1) {
         try runMembershipChangeScenario(cluster, next_epoch, seed);
+    }
+}
+
+test "reconfiguration: one-for-one voter replacement hands over to survivors" {
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    const next_epoch = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(next_epoch);
+    var seed: u64 = 1;
+    while (seed <= scenario_seeds) : (seed += 1) {
+        try runVoterReplacementScenario(cluster, next_epoch, seed);
     }
 }
