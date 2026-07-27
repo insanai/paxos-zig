@@ -313,56 +313,56 @@ fn addMisuseTests(
 const compile_fail_cases = [_]struct { src: []const u8, expected: []const u8 }{
     .{
         .src = "tests/compile_fail/protocol_zero_max_members.zig",
-        .expected = "error: paxos Protocol option max_members must be greater than zero",
+        .expected = "paxos Protocol option max_members must be greater than zero",
     },
     .{
         .src = "tests/compile_fail/protocol_zero_max_slots.zig",
-        .expected = "error: paxos Protocol option max_slots must be greater than zero",
+        .expected = "paxos Protocol option max_slots must be greater than zero",
     },
     .{
         .src = "tests/compile_fail/protocol_max_members_too_large.zig",
-        .expected = "error: paxos Protocol option max_members must be at most 65535",
+        .expected = "paxos Protocol option max_members must be at most 65535",
     },
     .{
         .src = "tests/compile_fail/protocol_max_slots_too_large.zig",
-        .expected = "error: paxos Protocol option max_slots must be at most 4294967295",
+        .expected = "paxos Protocol option max_slots must be at most 4294967295",
     },
     .{
         .src = "tests/compile_fail/protocol_zero_election_timeout.zig",
-        .expected = "error: paxos Protocol option election_timeout_ticks " ++
+        .expected = "paxos Protocol option election_timeout_ticks " ++
             "must be greater than zero",
     },
     .{
         .src = "tests/compile_fail/protocol_zero_heartbeat_interval.zig",
-        .expected = "error: paxos Protocol option heartbeat_interval_ticks " ++
+        .expected = "paxos Protocol option heartbeat_interval_ticks " ++
             "must be greater than zero",
     },
     .{
         .src = "tests/compile_fail/protocol_zero_resend_interval.zig",
-        .expected = "error: paxos Protocol option resend_interval_ticks " ++
+        .expected = "paxos Protocol option resend_interval_ticks " ++
             "must be greater than zero",
     },
     .{
         .src = "tests/compile_fail/protocol_pointer_value.zig",
-        .expected = "error: Value type '*u64' must not contain pointers, " ++
+        .expected = "Value type '*u64' must not contain pointers, " ++
             "slices, or references.",
     },
     .{
         .src = "tests/compile_fail/replicated_log_zero_max_batch.zig",
-        .expected = "error: paxos ReplicatedLog option max_batch must be greater than zero",
+        .expected = "paxos ReplicatedLog option max_batch must be greater than zero",
     },
     .{
         .src = "tests/compile_fail/replicated_log_batch_exceeds_entries.zig",
-        .expected = "error: paxos ReplicatedLog option max_batch must not exceed max_entries",
+        .expected = "paxos ReplicatedLog option max_batch must not exceed max_entries",
     },
     .{
         .src = "tests/compile_fail/replicated_log_metadata_too_large.zig",
-        .expected = "error: paxos ReplicatedLog option max_metadata_bytes " ++
+        .expected = "paxos ReplicatedLog option max_metadata_bytes " ++
             "must be at most 65535",
     },
     .{
         .src = "tests/compile_fail/learner_zero_max_entries.zig",
-        .expected = "error: paxos Learner option max_entries must be greater than zero",
+        .expected = "paxos Learner option max_entries must be greater than zero",
     },
 };
 
@@ -392,7 +392,7 @@ fn addCompileErrorTests(
         "tests/compile_fail/bit_set_zero_bits.zig",
         "bitset",
         "src/bit_set.zig",
-        "error: paxos BitSet bit_count must be greater than zero",
+        "paxos BitSet bit_count must be greater than zero",
     );
 
     // The derived-capacity overflow is only reachable where usize is 32 bits,
@@ -409,7 +409,7 @@ fn addCompileErrorTests(
         "tests/compile_fail/protocol_capacity_overflow.zig",
         "paxos",
         "src/root.zig",
-        "error: paxos Protocol options max_members and max_slots " ++
+        "paxos Protocol options max_members and max_slots " ++
             "overflow the derived message capacity",
     );
 
