@@ -42,3 +42,16 @@ jobs:
       - name: Extended simulation sweep
         if: matrix.os == 'ubuntu-latest'
         run: zig build sim -- --seeds=512 --steps=1024
+
+      - name: Install OpenSSL 3 for zaxonlite
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Zaxonlite unit and crash tests
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build test-zaxonlite
+
+      - name: Zaxonlite voter replacement scenario
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: zaxonlite
+        run: zig build test-replace-cluster
