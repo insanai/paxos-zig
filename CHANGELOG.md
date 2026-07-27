@@ -2,9 +2,16 @@
 
 ## Unreleased
 
+## 0.1.2 - 2026-07-28
+
 - Expose the decided stop slot (`ReplicatedLog.Node.stopSlot`) and a
   by-reference stop-sign accessor (`stopSign`), and latch the slot across
   restore, so hosts no longer hand-track where the seal landed.
+- Add `ReplicatedLog.Node.pendingStopSign`: the undecided stop value
+  retained in durable accepted state or leader proposals, so a host can
+  repair its own durable operation phase after a crash.
+- Export `paxos.version`; the benchmarks now print it instead of a
+  hard-coded release string.
 - Make `StopSign.create` public and extract `StopSign.validateMembers`,
   letting host wire decoders reuse the zero/duplicate member-ID checks.
 - Add changed-member `initFromStop` unit coverage and a deterministic
@@ -13,9 +20,6 @@
   survivor set, and rejection of the removed voter.
 - Add `specs/VoterReplacement.tla`, the bounded host-level model for the
   zaxonlite decided voter replacement built on this library (ZDS 0008).
-
-## 0.1.1 - 2026-07-27
-
 - Enforce the persist-then-send effect order in every optimize mode; a
   violation now stops the process with a stable diagnostic
   (`paxos: messagesSlice before confirmWritesDurable`,
