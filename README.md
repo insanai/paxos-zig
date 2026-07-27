@@ -294,8 +294,8 @@ performance, developer experience, in that order.
 
 ## Related projects
 
-- [zaxonlite](https://github.com/insanai/zaxonlite): an embedded replicated
-  SQLite built on this library.
+- [zaxonlite](https://github.com/insanai/zaxonlite): an embedded distributed
+  SQL database, built on SQLite and this library.
 - [zaxon-cli-ui](https://github.com/insanai/zaxon-cli-ui): the shared
   terminal UI used by the zaxon shell.
 - [zxdocs](https://github.com/insanai/zxdocs): the books and design records
