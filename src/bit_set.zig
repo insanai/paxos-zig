@@ -3,7 +3,11 @@ const std = @import("std");
 /// A fixed-capacity set whose storage is optimized for size and speed.
 /// Uses a single register for small sets (<= 64 bits) and an array of u64 words for larger sets.
 pub fn BitSet(comptime bit_count: usize) type {
-    comptime std.debug.assert(bit_count > 0);
+    comptime {
+        if (bit_count == 0) {
+            @compileError("paxos BitSet bit_count must be greater than zero");
+        }
+    }
     if (bit_count <= 64) {
         const Bits = std.meta.Int(.unsigned, bit_count);
         return struct {

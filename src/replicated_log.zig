@@ -32,9 +32,15 @@ pub const Options = struct {
 /// and starts the next configuration, just as it would cross a snapshot epoch.
 pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
     comptime {
-        std.debug.assert(options.max_batch > 0);
-        std.debug.assert(options.max_batch <= options.max_entries);
-        std.debug.assert(options.max_metadata_bytes <= std.math.maxInt(u16));
+        if (options.max_batch == 0) {
+            @compileError("paxos ReplicatedLog option max_batch must be greater than zero");
+        }
+        if (options.max_batch > options.max_entries) {
+            @compileError("paxos ReplicatedLog option max_batch must not exceed max_entries");
+        }
+        if (options.max_metadata_bytes > std.math.maxInt(u16)) {
+            @compileError("paxos ReplicatedLog option max_metadata_bytes must be at most 65535");
+        }
     }
 
     const StopSignType = struct {

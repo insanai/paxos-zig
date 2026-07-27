@@ -32,9 +32,21 @@ pub const Options = struct {
     heartbeat_interval_ticks: u32 = 3,
     /// Leader ticks between bounded retransmission scans.
     resend_interval_ticks: u32 = 10,
-    /// Debug-build check that hosts confirm durability before reading messages.
-    assert_effect_order: bool = true,
 };
+
+/// Whether the generated type enforces the persist-then-send ordering
+/// contract at runtime. `Protocol` always selects `.enforced`; the
+/// `host_managed` namespace is the only path to `.host_managed`.
+pub const DurabilityGate = enum { enforced, host_managed };
+
+/// Reports a host ordering violation and stops the process in every build
+/// mode. Continuing is not safe: a message claiming durability for a write
+/// that was never confirmed can retract a promise or vote after a crash.
+noinline fn hostOrderViolation(comptime what: []const u8) noreturn {
+    @branchHint(.cold);
+    std.debug.print("paxos: " ++ what ++ "\n", .{});
+    std.process.abort();
+}
 
 /// A totally ordered, globally unique proposal attempt.
 pub const Ballot = struct {
@@ -74,14 +86,49 @@ pub const Ballot = struct {
 /// Values should be self-contained (for example, an ID or fixed-size command),
 /// since message serialization and ownership remain the application's concern.
 pub fn Protocol(comptime Value: type, comptime options: Options) type {
+    return ProtocolGated(Value, options, .enforced);
+}
+
+/// Shared implementation behind `Protocol` and `host_managed.Protocol`.
+/// Reached from `host_managed.zig` only; root.zig does not re-export it.
+pub fn ProtocolGated(
+    comptime Value: type,
+    comptime options: Options,
+    comptime gate: DurabilityGate,
+) type {
     comptime {
-        std.debug.assert(options.max_members > 0);
-        std.debug.assert(options.max_slots > 0);
-        std.debug.assert(options.max_members <= std.math.maxInt(u16));
-        std.debug.assert(options.max_slots <= std.math.maxInt(Slot));
-        std.debug.assert(options.election_timeout_ticks > 0);
-        std.debug.assert(options.heartbeat_interval_ticks > 0);
-        std.debug.assert(options.resend_interval_ticks > 0);
+        if (options.max_members == 0) {
+            @compileError("paxos Protocol option max_members must be greater than zero");
+        }
+        if (options.max_slots == 0) {
+            @compileError("paxos Protocol option max_slots must be greater than zero");
+        }
+        if (options.max_members > std.math.maxInt(u16)) {
+            @compileError("paxos Protocol option max_members must be at most 65535");
+        }
+        if (options.max_slots > std.math.maxInt(Slot)) {
+            @compileError("paxos Protocol option max_slots must be at most 4294967295");
+        }
+        if (options.election_timeout_ticks == 0) {
+            @compileError("paxos Protocol option election_timeout_ticks must be greater than zero");
+        }
+        if (options.heartbeat_interval_ticks == 0) {
+            @compileError("paxos Protocol option heartbeat_interval_ticks " ++
+                "must be greater than zero");
+        }
+        if (options.resend_interval_ticks == 0) {
+            @compileError("paxos Protocol option resend_interval_ticks must be greater than zero");
+        }
+        const wide_messages = @as(u128, options.max_members) * options.max_slots +
+            options.max_members + 1;
+        if (wide_messages > std.math.maxInt(usize)) {
+            @compileError("paxos Protocol options max_members and max_slots overflow " ++
+                "the derived message capacity");
+        }
+        const wide_writes = @as(u128, options.max_slots) * 2 + 1;
+        if (wide_writes > std.math.maxInt(usize)) {
+            @compileError("paxos Protocol option max_slots overflows the derived write capacity");
+        }
         if (hasPointers(Value)) {
             @compileError(
                 "Value type '" ++ @typeName(Value) ++
@@ -304,10 +351,14 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
                 std.debug.assert(self.writes_count <= self.writes.len);
                 std.debug.assert(self.messages_count <= self.messages.len);
                 std.debug.assert(self.committed_count <= self.committed.len);
-                if (options.assert_effect_order) {
+                if (comptime gate == .enforced) {
                     // A nonempty write batch was discarded without the host
-                    // confirming durability; replies for it may already be out.
-                    std.debug.assert(self.writes_count == 0 or self.writes_confirmed);
+                    // confirming durability; replies for it may already be
+                    // out. `writes_confirmed` is false only while such a
+                    // batch is pending, so one load decides.
+                    if (!self.writes_confirmed) {
+                        hostOrderViolation("reset discarded unconfirmed writes");
+                    }
                 }
                 self.writes_count = 0;
                 self.messages_count = 0;
@@ -362,10 +413,14 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
             }
 
             /// Messages that may be sent only after all writes are synced.
-            /// Debug builds assert `confirmWritesDurable` ran for this batch.
+            /// Every build mode checks that `confirmWritesDurable` ran for
+            /// this batch and stops the process on a violation.
             pub fn messagesSlice(self: *const Effects) []const Envelope {
-                if (options.assert_effect_order) {
-                    std.debug.assert(self.writes_count == 0 or self.writes_confirmed);
+                if (comptime gate == .enforced) {
+                    // False only while an unconfirmed write batch is pending.
+                    if (!self.writes_confirmed) {
+                        hostOrderViolation("messagesSlice before confirmWritesDurable");
+                    }
                 }
                 return self.messages[0..self.messages_count];
             }
@@ -1905,27 +1960,10 @@ test "effects track durability confirmation for each write batch" {
     try std.testing.expect(effects.writes_confirmed);
     try std.testing.expect(effects.messagesSlice().len > 0);
 
-    // Hosts that opt out of the guard may read messages without confirming.
-    const Unchecked = Protocol(u64, .{
-        .max_members = 3,
-        .max_slots = 16,
-        .assert_effect_order = false,
-    });
-    var unchecked_membership: Unchecked.Membership = undefined;
-    try unchecked_membership.init(&.{ 1, 2, 3 });
-    var unchecked_node: Unchecked.Node = undefined;
-    try unchecked_node.init(2, &unchecked_membership);
-    var unchecked_effects = Unchecked.Effects{};
-    try unchecked_node.step(.{
-        .from = 1,
-        .to = 2,
-        .message = .{ .prepare = .{
-            .ballot = .{ .round = 1, .node = 1 },
-            .decided_through = 0,
-        } },
-    }, &unchecked_effects);
-    try std.testing.expect(unchecked_effects.writes_count > 0);
-    try std.testing.expect(unchecked_effects.messagesSlice().len > 0);
+    // A confirmed batch may be reset and reused for the next transition.
+    effects.reset();
+    try std.testing.expect(effects.writes_confirmed);
+    try std.testing.expectEqual(@as(usize, 0), effects.writes_count);
 }
 
 test "only accept requests are available before durability confirmation" {

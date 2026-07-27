@@ -25,7 +25,11 @@ pub const LearnResult = enum {
 };
 
 pub fn Learner(comptime Value: type, comptime options: Options) type {
-    comptime std.debug.assert(options.max_entries > 0);
+    comptime {
+        if (options.max_entries == 0) {
+            @compileError("paxos Learner option max_entries must be greater than zero");
+        }
+    }
 
     return struct {
         const Self = @This();

@@ -3,8 +3,9 @@
 //! The library performs no I/O and owns no threads or clocks. A `Node` consumes
 //! messages and emits `Effects`. Persist `Effects.writes` before transmitting
 //! `Effects.messages`; this ordering is part of the safety contract. After
-//! syncing a batch, call `Effects.confirmWritesDurable`; debug builds assert
-//! the ordering and panic on hosts that send before persisting.
+//! syncing a batch, call `Effects.confirmWritesDurable`. Every build mode
+//! checks the ordering and stops hosts that send before persisting; the
+//! `host_managed` namespace is the only audited exception.
 
 const protocol = @import("protocol.zig");
 const replicated_log = @import("replicated_log.zig");
@@ -30,6 +31,9 @@ pub const LearnerOptions = learner.Options;
 pub const Learner = learner.Learner;
 /// Returns a human-friendly Elm-style explanation of any error.
 pub const explainError = @import("errors.zig").explainError;
+/// Protocol factory for hosts that own the durability boundary themselves.
+/// Read the namespace warning before using it; every use is audited.
+pub const host_managed = @import("host_managed.zig");
 
 test {
     _ = @import("bit_set.zig");
@@ -37,4 +41,5 @@ test {
     _ = @import("replicated_log.zig");
     _ = @import("learner.zig");
     _ = @import("errors.zig");
+    _ = @import("host_managed.zig");
 }
