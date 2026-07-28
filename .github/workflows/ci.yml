@@ -2,7 +2,10 @@
 #
 # The library is zero-dependency and does no I/O, so the pipeline is the
 # same three commands a contributor runs locally: style, tests with the
-# seeded fault simulation, and a longer simulation sweep.
+# seeded fault simulation, and a longer simulation sweep. The Linux job
+# then checks out insanai/zaxonlite into zaxonlite/ (the layout its
+# `.path = ".."` manifest expects) and runs its tests, so a library
+# change that breaks the downstream consumer fails here, not there.
 name: CI
 
 on:
@@ -43,11 +46,29 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: zig build sim -- --seeds=512 --steps=1024
 
+      # While insanai/zaxonlite is private, add a CROSS_REPO_TOKEN secret
+      # (fine-grained PAT with read access to it); once public, the
+      # default token fallback is enough.
+      - name: Checkout zaxonlite (downstream consumer)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/checkout@v4
+        with:
+          repository: insanai/zaxonlite
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: zaxonlite
+
       - name: Install OpenSSL 3 for zaxonlite
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
-      - name: Zaxonlite unit and crash tests
+      # Zig's zip fetch (the SQLite amalgamation) writes its temporary
+      # file under the global cache's tmp/ directory but does not create
+      # it.
+      - name: Prepare Zig package cache
+        if: matrix.os == 'ubuntu-latest'
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
+
+      - name: Zaxonlite unit and integration tests
         if: matrix.os == 'ubuntu-latest'
         run: zig build test-zaxonlite
 

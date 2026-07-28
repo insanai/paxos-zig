@@ -25,12 +25,10 @@ publish_subtree() {
     git branch -D "$branch" >/dev/null
 }
 
-publish_subtree zaxonlite zaxonlite
-publish_subtree zaxonlite/src/cli_ui zaxon-cli-ui
-publish_subtree docs zxdocs
-
 # paxos-zig is the root minus the split directories. git subtree cannot
-# exclude paths, so filter a throwaway clone and push its history.
+# exclude paths, so filter a throwaway clone and push its history. It is
+# pushed FIRST: the other repos build against paxos-zig main, so their
+# push-triggered CI must already see the matching library revision.
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 # --no-local: git-filter-repo refuses hardlinked local clones.
@@ -40,3 +38,7 @@ git clone --quiet --no-local "$(pwd)" "$workdir/paxos-zig"
     git filter-repo --quiet --invert-paths --path zaxonlite --path docs
     git push "${remote_base}/paxos-zig.git" refs/heads/main:refs/heads/main
 )
+
+publish_subtree zaxonlite zaxonlite
+publish_subtree zaxonlite/src/cli_ui zaxon-cli-ui
+publish_subtree docs zxdocs
