@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-07-30
+
+- Add the native `zxlite` Python SDK for CPython 3.12 and newer, including a
+  SQLite-shaped DB-API 2.0 interface and a SQLAlchemy 2.x dialect.
+- Add Python-hosted zaxonlite servers plus redundant multi-seed remote
+  connections, consistency-aware concurrent reads, serialized writes, and
+  typed hybrid search over the native client protocol.
+- Add stable C APIs for embedded servers, remote connection pools, prepared
+  values and result rows, batched execution, and typed search.
+- Add replicated FTS5 and sqlite-vec hybrid search with bounded candidate
+  collection, reciprocal-rank and distribution-based fusion, and Zig SIMD
+  reranking.
+- Add voter replacement, durable stop-sign recovery, and the host-managed
+  durability boundary for grouped write barriers.
+- Harden Linux and macOS connection shutdown, strict C11 C-ABI builds, and
+  Python native linking under Zig 0.16.
+- Publish release CLI archives, CPython Stable ABI wheels, checksums, and the
+  `zxlite` package on PyPI from the tagged GitHub workflow.
+
 ## 0.1.2 - 2026-07-28
 
 - Expose the decided stop slot (`ReplicatedLog.Node.stopSlot`) and a

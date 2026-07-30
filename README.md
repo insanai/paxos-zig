@@ -64,7 +64,7 @@ build the library this way.
 Once a release is tagged, let Zig pin the content hash:
 
 ```sh
-zig fetch --save https://github.com/insanai/paxos-zig/archive/refs/tags/v0.1.2.tar.gz
+zig fetch --save https://github.com/insanai/paxos-zig/archive/refs/tags/v0.2.0.tar.gz
 ```
 
 Then expose the module in your `build.zig`:
