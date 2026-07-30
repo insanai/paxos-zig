@@ -15,13 +15,20 @@ set -eu
 cd "$(git rev-parse --show-toplevel)"
 remote_base="git@github.com:insanai"
 
+force=""
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force) force="--force" ;;
+    esac
+done
+
 publish_subtree() {
     prefix="$1"
     repo="$2"
     branch="split-publish/${repo}"
     git branch -D "$branch" >/dev/null 2>&1 || true
     git subtree split --prefix="$prefix" -b "$branch" >/dev/null
-    git push "${remote_base}/${repo}.git" "refs/heads/${branch}:refs/heads/main"
+    git push $force "${remote_base}/${repo}.git" "refs/heads/${branch}:refs/heads/main"
     git branch -D "$branch" >/dev/null
 }
 
@@ -36,7 +43,7 @@ git clone --quiet --no-local "$(pwd)" "$workdir/paxos-zig"
 (
     cd "$workdir/paxos-zig"
     git filter-repo --quiet --invert-paths --path zaxonlite --path docs
-    git push "${remote_base}/paxos-zig.git" refs/heads/main:refs/heads/main
+    git push $force "${remote_base}/paxos-zig.git" refs/heads/main:refs/heads/main
 )
 
 publish_subtree zaxonlite zaxonlite
