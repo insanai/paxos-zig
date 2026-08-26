@@ -45,7 +45,7 @@
 EXTENDS Integers, FiniteSets
 
 CONSTANTS DataVoters, Witnesses, Joiner, W, MaxSlot, MaxRound, Values,
-          Noop, None
+          Noop, None, MaxMessages
 
 Voters == DataVoters \cup Witnesses
 
@@ -499,9 +499,10 @@ Monotone ==
 
 ----------------------------------------------------------------------------
 (* Bounded model checking: the monotonic message set explodes the state    *)
-(* space, so behaviors are capped by distinct message count.  Twenty-two   *)
-(* covers a full ballot over several slots, a competing ballot after a     *)
-(* trim, and the catch-up traffic the window forces.                       *)
-MessageBound == Cardinality(msgs) <= 22
+(* space, so behaviors are capped by the configured distinct message       *)
+(* count.  Eighteen covers a full ballot over several slots, a competing   *)
+(* ballot after a trim, and the catch-up traffic the window forces;        *)
+(* deeper bounds trade run time for longer interleavings.                  *)
+MessageBound == Cardinality(msgs) <= MaxMessages
 
 =============================================================================
