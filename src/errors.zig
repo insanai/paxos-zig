@@ -20,6 +20,13 @@ pub fn explainError(err: anyerror) []const u8 {
         error.UnknownNode,
         => explainInputError(err),
 
+        error.NotVoter,
+        error.NotLearner,
+        error.LearnerIsVoter,
+        error.LearnerMessageForbidden,
+        error.ConfigurationMismatch,
+        => explainRoleError(err),
+
         error.NotLeader,
         error.SlotLimitReached,
         error.EmptyBatch,
@@ -28,11 +35,13 @@ pub fn explainError(err: anyerror) []const u8 {
         error.InvalidPromise,
         error.MissingNoop,
         error.MissingProposedValue,
+        error.CampaignDisabled,
         => explainProgressError(err),
 
         error.PromiseRegression,
         error.ConflictingValue,
         error.ConflictingCommit,
+        error.ConflictingChosenValue,
         => explainSafetyError(err),
 
         error.InvalidConfigurationId,
@@ -143,6 +152,42 @@ fn explainInputError(err: anyerror) []const u8 {
     };
 }
 
+fn explainRoleError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotVoter =>
+        \\-- NOT A VOTER ------------------------------------------------------------------
+        \\
+        \\A voter-only operation ran on a node outside the voting membership.
+        \\Hint: Route proposals and campaigns to a configured voting member.
+        ,
+        error.NotLearner =>
+        \\-- NOT A LEARNER ----------------------------------------------------------------
+        \\
+        \\A learner-only operation ran on a voting member.
+        \\Hint: Use the voter step path; learnChosen is for non-voting nodes.
+        ,
+        error.LearnerIsVoter =>
+        \\-- LEARNER IS A VOTER -----------------------------------------------------------
+        \\
+        \\A learner was initialized with an ID inside the voting membership.
+        \\Hint: Give learners IDs outside the configured voter set.
+        ,
+        error.LearnerMessageForbidden =>
+        \\-- LEARNER MESSAGE FORBIDDEN ----------------------------------------------------
+        \\
+        \\A learner received a message kind only voters may process.
+        \\Hint: Send learners commits and heartbeats only.
+        ,
+        error.ConfigurationMismatch =>
+        \\-- CONFIGURATION MISMATCH -------------------------------------------------------
+        \\
+        \\The message's configuration ID differs from the local one.
+        \\Hint: Finish the configuration handover before mixing traffic.
+        ,
+        else => unreachable,
+    };
+}
+
 fn explainProgressError(err: anyerror) []const u8 {
     return switch (err) {
         error.NotLeader =>
@@ -193,6 +238,12 @@ fn explainProgressError(err: anyerror) []const u8 {
         \\An acknowledgement names a slot with no local leader proposal.
         \\Hint: Preserve proposal state until the slot commits.
         ,
+        error.CampaignDisabled =>
+        \\-- CAMPAIGN DISABLED ------------------------------------------------------------
+        \\
+        \\This voter is configured to never start elections.
+        \\Hint: Campaign from a member whose priority permits leadership.
+        ,
         else => unreachable,
     };
 }
@@ -215,6 +266,12 @@ fn explainSafetyError(err: anyerror) []const u8 {
         \\-- CONFLICTING COMMIT ----------------------------------------------------------
         \\
         \\One slot observed two different committed values.
+        \\Hint: Treat this as a safety incident; stop and retain all evidence.
+        ,
+        error.ConflictingChosenValue =>
+        \\-- CONFLICTING CHOSEN VALUE -----------------------------------------------------
+        \\
+        \\A learner saw two different chosen values for one slot.
         \\Hint: Treat this as a safety incident; stop and retain all evidence.
         ,
         else => unreachable,
