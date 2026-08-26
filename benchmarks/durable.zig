@@ -23,7 +23,7 @@ const paxos = @import("paxos");
 const node_count = 3;
 const value_count = 512;
 const sample_count = 3;
-const record_size = 33;
+const record_size = 37;
 
 const P = paxos.host_managed.Protocol(u64, .{
     .max_members = node_count,
@@ -287,7 +287,7 @@ fn verifyJournals(io: std.Io, sample_index: usize) !void {
     }
 }
 
-/// Fixed 33-byte little-endian record: tag, ballot, slot, value.
+/// Fixed 37-byte little-endian record: tag, ballot, 64-bit slot, value.
 fn encode(write: P.Write, out: []u8) void {
     var ballot = paxos.Ballot.zero;
     var slot: paxos.Slot = 0;
@@ -314,13 +314,13 @@ fn encode(write: P.Write, out: []u8) void {
     std.mem.writeInt(u64, out[1..9], ballot.round, .little);
     std.mem.writeInt(u32, out[9..13], ballot.priority, .little);
     std.mem.writeInt(u32, out[13..17], ballot.node, .little);
-    std.mem.writeInt(u32, out[17..21], slot, .little);
-    std.mem.writeInt(u64, out[21..29], value, .little);
-    std.mem.writeInt(u32, out[29..33], 0, .little);
+    std.mem.writeInt(u64, out[17..25], slot, .little);
+    std.mem.writeInt(u64, out[25..33], value, .little);
+    std.mem.writeInt(u32, out[33..37], 0, .little);
 }
 
 fn decode(bytes: *const [record_size]u8) !P.Write {
-    if (std.mem.readInt(u32, bytes[29..33], .little) != 0) {
+    if (std.mem.readInt(u32, bytes[33..37], .little) != 0) {
         return error.InvalidJournalRecord;
     }
     const ballot = paxos.Ballot{
@@ -328,8 +328,8 @@ fn decode(bytes: *const [record_size]u8) !P.Write {
         .priority = std.mem.readInt(u32, bytes[9..13], .little),
         .node = std.mem.readInt(u32, bytes[13..17], .little),
     };
-    const slot = std.mem.readInt(u32, bytes[17..21], .little);
-    const value = std.mem.readInt(u64, bytes[21..29], .little);
+    const slot = std.mem.readInt(u64, bytes[17..25], .little);
+    const value = std.mem.readInt(u64, bytes[25..33], .little);
     return switch (bytes[0]) {
         1 => .{ .promise = ballot },
         2 => .{ .accept = .{ .ballot = ballot, .slot = slot, .value = value } },

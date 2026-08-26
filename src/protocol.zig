@@ -13,8 +13,9 @@ const BitSet = @import("bit_set.zig").BitSet;
 
 /// Stable identity of one voting member. Zero is reserved.
 pub const NodeId = u32;
-/// One-based position in a bounded protocol log. Zero means no slot.
-pub const Slot = u32;
+/// One-based position in the global protocol log. Zero means no slot.
+/// A 64-bit slot never resets over a database lifetime (ZDS 0011).
+pub const Slot = u64;
 
 /// Compile-time capacities, quorum policy, and logical clock intervals.
 pub const Options = struct {
@@ -105,9 +106,6 @@ pub fn ProtocolGated(
         }
         if (options.max_members > std.math.maxInt(u16)) {
             @compileError("paxos Protocol option max_members must be at most 65535");
-        }
-        if (options.max_slots > std.math.maxInt(Slot)) {
-            @compileError("paxos Protocol option max_slots must be at most 4294967295");
         }
         if (options.election_timeout_ticks == 0) {
             @compileError("paxos Protocol option election_timeout_ticks must be greater than zero");
@@ -1464,7 +1462,7 @@ pub fn ProtocolGated(
         fn slotIndex(slot: Slot) !usize {
             if (slot == 0) return error.InvalidSlot;
             if (slot > options.max_slots) return error.SlotLimitReached;
-            return @as(usize, slot - 1);
+            return @intCast(slot - 1);
         }
 
         fn slotAfter(slot: Slot) Slot {

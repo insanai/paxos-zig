@@ -324,10 +324,6 @@ const compile_fail_cases = [_]struct { src: []const u8, expected: []const u8 }{
         .expected = "paxos Protocol option max_members must be at most 65535",
     },
     .{
-        .src = "tests/compile_fail/protocol_max_slots_too_large.zig",
-        .expected = "paxos Protocol option max_slots must be at most 4294967295",
-    },
-    .{
         .src = "tests/compile_fail/protocol_zero_election_timeout.zig",
         .expected = "paxos Protocol option election_timeout_ticks " ++
             "must be greater than zero",
