@@ -32,7 +32,7 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
         const Self = @This();
         pub const P = paxos.Protocol(u64, proto_options);
         const max_nodes = proto_options.max_members;
-        const max_slots = proto_options.max_slots;
+        const max_slots = proto_options.window_slots;
         const journal_capacity = 16_384;
         const network_capacity = 2_048;
         const trace_capacity = 48;
@@ -219,7 +219,7 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
 
         fn ignoreProposeError(self: *Self, err: anyerror) !void {
             return switch (err) {
-                error.NotLeader, error.SlotLimitReached => {},
+                error.NotLeader, error.WindowFull => {},
                 else => self.fail("propose returned {t}", err),
             };
         }
@@ -250,7 +250,7 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
                     return self.fail("journal replay returned {t}", err);
                 };
             }
-            try self.mergeGolden(&replayed.committed);
+            try self.mergeGolden(&replayed);
             self.nodes[index].restoreWithPriority(
                 @intCast(index + 1),
                 &self.membership,
@@ -387,20 +387,21 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
                 return self.fail("decided prefix regressed on node {d}", index + 1);
             }
             self.shadow_decided[index] = node.decidedThrough();
-            try self.mergeGolden(&node.durable.committed);
+            try self.mergeGolden(&node.durable);
         }
 
         /// Agreement and validity: the first durable commit for a slot fixes
         /// its value forever, and every value was proposed or is the no-op.
-        fn mergeGolden(self: *Self, committed: *const [max_slots]?u64) !void {
-            for (committed, 0..) |entry, slot_index| {
-                const value = entry orelse continue;
+        fn mergeGolden(self: *Self, durable: *const P.DurableState) !void {
+            for (&durable.cells) |*cell| {
+                const value = cell.committed orelse continue;
+                const slot_index: usize = @intCast(cell.slot - 1);
                 if (value != noop and value > self.issued) {
-                    return self.fail("unproposed value committed in slot {d}", slot_index + 1);
+                    return self.fail("unproposed value committed in slot {d}", cell.slot);
                 }
                 if (self.golden[slot_index]) |chosen| {
                     if (chosen != value) {
-                        return self.fail("conflicting decisions in slot {d}", slot_index + 1);
+                        return self.fail("conflicting decisions in slot {d}", cell.slot);
                     }
                 } else {
                     self.golden[slot_index] = value;
@@ -531,14 +532,15 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
                         node.next_slot,
                     },
                 );
-                for (0..@min(max_slots, 6)) |slot_index| {
-                    const accepted = node.durable.accepted[slot_index];
-                    const committed = node.durable.committed[slot_index];
+                for (&node.durable.cells) |*cell| {
+                    if (cell.slot == 0 or cell.slot > 6) continue;
+                    const accepted = cell.accepted;
+                    const committed = cell.committed;
                     if (accepted == null and committed == null) continue;
                     std.debug.print(
                         "    slot {d}: accepted=({d},{d})@{d} committed={?d}\n",
                         .{
-                            slot_index + 1,
+                            cell.slot,
                             if (accepted) |a| a.ballot.round else 0,
                             if (accepted) |a| a.ballot.node else 0,
                             if (accepted) |a| a.value else 0,
@@ -562,7 +564,7 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
 /// Three-node majority configuration exercised by the default test sweep.
 pub const Sim3 = Simulator(.{
     .max_members = 3,
-    .max_slots = 32,
+    .window_slots = 32,
     .election_timeout_ticks = 4,
     .heartbeat_interval_ticks = 2,
     .resend_interval_ticks = 3,
@@ -571,7 +573,7 @@ pub const Sim3 = Simulator(.{
 /// Five-node flexible-quorum configuration (phase one 4, phase two 2).
 pub const Sim5Flexible = Simulator(.{
     .max_members = 5,
-    .max_slots = 32,
+    .window_slots = 32,
     .read_quorum_size = 4,
     .write_quorum_size = 2,
     .election_timeout_ticks = 4,

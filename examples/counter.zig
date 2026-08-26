@@ -8,7 +8,7 @@ const Command = struct {
     amount: i64,
 };
 
-const P = paxos.Protocol(Command, .{ .max_members = 3, .max_slots = 32 });
+const P = paxos.Protocol(Command, .{ .max_members = 3, .window_slots = 32 });
 
 pub fn main(_: std.process.Init) !void {
     var membership: P.Membership = undefined;

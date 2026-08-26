@@ -88,12 +88,12 @@ fn Bench(
     comptime ValueT: type,
     comptime node_count: comptime_int,
     comptime value_count: u64,
-    comptime max_slots: usize,
+    comptime window_slots: usize,
     comptime measurement_iterations: u64,
 ) type {
     const P = paxos.Protocol(ValueT, .{
         .max_members = node_count,
-        .max_slots = max_slots,
+        .window_slots = window_slots,
     });
     const queue_capacity = 8_192;
     // Leader-to-peer accept, accepted reply, and commit per value.
@@ -307,7 +307,7 @@ fn Bench(
                 @as(f64, @floatFromInt(measured_values));
             std.debug.print(
                 \\workload:       {s} mode={s} (Zig Multi-Paxos {s})
-                \\values:         {d} ({d} x {d} iterations) nodes={d} payload={d}B max_slots={d}
+                \\values:         {d} ({d} x {d} iterations) nodes={d} payload={d}B window_slots={d}
                 \\median_ns:      {d} (min {d}, max {d} across {d} samples)
                 \\ns_per_value:   {d:.2}
                 \\window-average ns/value p50/p90/p99/max: {d}/{d}/{d}/{d}
@@ -320,7 +320,7 @@ fn Bench(
                 paxos.version,          measured_values,
                 value_count,            measurement_iterations,
                 node_count,             @sizeOf(ValueT),
-                max_slots,              median.nanoseconds,
+                window_slots,           median.nanoseconds,
                 samples[0].nanoseconds, samples[sample_count - 1].nanoseconds,
                 sample_count,           per_value,
                 window_ns_per_value[0], window_ns_per_value[1],
@@ -345,7 +345,7 @@ fn Bench(
                     workload,                              mode.name,
                     measured_values,                       node_count,
                     @sizeOf(ValueT),                       value_count,
-                    measurement_iterations,                max_slots,
+                    measurement_iterations,                window_slots,
                     median.nanoseconds,                    samples[0].nanoseconds,
                     samples[sample_count - 1].nanoseconds, per_value,
                     window_ns_per_value[0],                window_ns_per_value[1],

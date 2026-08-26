@@ -15,11 +15,11 @@
 const std = @import("std");
 const paxos = @import("paxos");
 
-const max_entries = 8;
+const window_slots = 8;
 
 const Log = paxos.ReplicatedLog(u64, .{
     .max_members = 4,
-    .max_entries = max_entries,
+    .window_slots = window_slots,
     .max_batch = 2,
     .max_metadata_bytes = 32,
     .election_timeout_ticks = 8,
@@ -273,7 +273,7 @@ const Cluster = struct {
     fn expectNothingAfterSeal(self: *Cluster, seal_slot: paxos.Slot) !void {
         for (0..node_count) |index| {
             var slot: paxos.Slot = seal_slot + 1;
-            while (slot <= max_entries) : (slot += 1) {
+            while (slot <= window_slots) : (slot += 1) {
                 if (self.nodes[index].read(slot) != null) {
                     return self.fail("node {d} decided slot {d} past the seal", .{
                         self.ids[index],

@@ -316,8 +316,12 @@ const compile_fail_cases = [_]struct { src: []const u8, expected: []const u8 }{
         .expected = "paxos Protocol option max_members must be greater than zero",
     },
     .{
-        .src = "tests/compile_fail/protocol_zero_max_slots.zig",
-        .expected = "paxos Protocol option max_slots must be greater than zero",
+        .src = "tests/compile_fail/protocol_zero_window_slots.zig",
+        .expected = "paxos Protocol option window_slots must be greater than zero",
+    },
+    .{
+        .src = "tests/compile_fail/protocol_window_not_power_of_two.zig",
+        .expected = "paxos Protocol option window_slots must be a power of two",
     },
     .{
         .src = "tests/compile_fail/protocol_max_members_too_large.zig",
@@ -348,8 +352,8 @@ const compile_fail_cases = [_]struct { src: []const u8, expected: []const u8 }{
         .expected = "paxos ReplicatedLog option max_batch must be greater than zero",
     },
     .{
-        .src = "tests/compile_fail/replicated_log_batch_exceeds_entries.zig",
-        .expected = "paxos ReplicatedLog option max_batch must not exceed max_entries",
+        .src = "tests/compile_fail/replicated_log_batch_exceeds_window.zig",
+        .expected = "paxos ReplicatedLog option max_batch must not exceed window_slots",
     },
     .{
         .src = "tests/compile_fail/replicated_log_metadata_too_large.zig",
@@ -405,7 +409,7 @@ fn addCompileErrorTests(
         "tests/compile_fail/protocol_capacity_overflow.zig",
         "paxos",
         "src/root.zig",
-        "paxos Protocol options max_members and max_slots " ++
+        "paxos Protocol options max_members and window_slots " ++
             "overflow the derived message capacity",
     );
 

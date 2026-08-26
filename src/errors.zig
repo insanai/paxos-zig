@@ -28,7 +28,8 @@ pub fn explainError(err: anyerror) []const u8 {
         => explainRoleError(err),
 
         error.NotLeader,
-        error.SlotLimitReached,
+        error.WindowFull,
+        error.GlobalSlotExhausted,
         error.EmptyBatch,
         error.SlotBufferTooSmall,
         error.BallotExhausted,
@@ -50,6 +51,7 @@ pub fn explainError(err: anyerror) []const u8 {
         error.BatchTooLarge,
         error.ConfigurationIdRegression,
         error.ConfigurationIdExhausted,
+        error.WindowOverrun,
         => explainLogError(err),
 
         else =>
@@ -196,11 +198,17 @@ fn explainProgressError(err: anyerror) []const u8 {
         \\This node has not completed phase one for its current ballot.
         \\Hint: Route to currentLeader() or wait for a successful campaign.
         ,
-        error.SlotLimitReached =>
-        \\-- SLOT LIMIT REACHED -----------------------------------------------------------
+        error.WindowFull =>
+        \\-- WINDOW FULL ------------------------------------------------------------------
         \\
-        \\The bounded epoch has no unused proposal slot.
-        \\Hint: Reserve space early, checkpoint, and start a decided next epoch.
+        \\Every consensus cell holds a live slot; this is transient flow control.
+        \\Hint: Retry after the memory floor advances past delivered slots.
+        ,
+        error.GlobalSlotExhausted =>
+        \\-- GLOBAL SLOT EXHAUSTED --------------------------------------------------------
+        \\
+        \\The 64-bit global slot space is exhausted and never wraps to zero.
+        \\Hint: This database has reached the end of its logical history.
         ,
         error.EmptyBatch =>
         \\-- EMPTY BATCH -----------------------------------------------------------------
@@ -223,7 +231,7 @@ fn explainProgressError(err: anyerror) []const u8 {
         error.InvalidPromise =>
         \\-- INVALID PROMISE --------------------------------------------------------------
         \\
-        \\A completion marker claims more accepted entries than max_slots.
+        \\A completion marker claims more accepted entries than window_slots.
         \\Hint: Reject the peer and verify codec and protocol bounds.
         ,
         error.MissingNoop =>
@@ -315,6 +323,12 @@ fn explainLogError(err: anyerror) []const u8 {
         \\
         \\No configuration ID exists after maxInt(u64).
         \\Hint: Stop and investigate configuration churn before recovery.
+        ,
+        error.WindowOverrun =>
+        \\-- WINDOW OVERRUN ---------------------------------------------------------------
+        \\
+        \\A journal record addresses a cell still occupied by an earlier slot.
+        \\Hint: Stop the node; the journal ran past the window without an anchor.
         ,
         else => unreachable,
     };

@@ -15,7 +15,8 @@ const protocol = @import("protocol.zig");
 /// Compile-time bounds and protocol policy for a sealed, reconfigurable log.
 pub const Options = struct {
     max_members: usize = 7,
-    max_entries: usize = 256,
+    /// Power-of-two consensus window forwarded to the core (ZDS 0011).
+    window_slots: usize = 256,
     max_batch: usize = 64,
     max_metadata_bytes: usize = 256,
     read_quorum_size: ?u16 = null,
@@ -35,8 +36,8 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
         if (options.max_batch == 0) {
             @compileError("paxos ReplicatedLog option max_batch must be greater than zero");
         }
-        if (options.max_batch > options.max_entries) {
-            @compileError("paxos ReplicatedLog option max_batch must not exceed max_entries");
+        if (options.max_batch > options.window_slots) {
+            @compileError("paxos ReplicatedLog option max_batch must not exceed window_slots");
         }
         if (options.max_metadata_bytes > std.math.maxInt(u16)) {
             @compileError("paxos ReplicatedLog option max_metadata_bytes must be at most 65535");
@@ -106,7 +107,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
 
     const Core = protocol.Protocol(EntryType, .{
         .max_members = options.max_members,
-        .max_slots = options.max_entries,
+        .window_slots = options.window_slots,
         .read_quorum_size = options.read_quorum_size,
         .write_quorum_size = options.write_quorum_size,
         .election_timeout_ticks = options.election_timeout_ticks,
@@ -418,17 +419,18 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             /// its own durable operation phase after a crash.
             pub fn pendingStopSign(self: *const Node) ?StopSign {
                 if (self.stop_sign) |stop| return stop;
-                for (self.core.durable.accepted, 0..) |accepted, index| {
-                    if (self.core.durable.committed[index] != null) continue;
-                    const entry = accepted orelse continue;
+                for (&self.core.durable.cells) |*cell| {
+                    if (cell.slot == 0 or cell.committed != null) continue;
+                    const entry = cell.accepted orelse continue;
                     switch (entry.value) {
                         .command => {},
                         .stop => |stop| return stop,
                     }
                 }
-                for (self.core.proposals, 0..) |proposal, index| {
-                    if (self.core.durable.committed[index] != null) continue;
-                    const entry = proposal orelse continue;
+                for (&self.core.lead) |*cell| {
+                    if (cell.slot == 0) continue;
+                    if (self.core.durable.committedAt(cell.slot) != null) continue;
+                    const entry = cell.proposal orelse continue;
                     switch (entry) {
                         .command => {},
                         .stop => |stop| return stop,
@@ -442,32 +444,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                     self.stop_pending = true;
                     return;
                 }
-                var pending = false;
-                for (self.core.durable.accepted, 0..) |accepted, index| {
-                    if (self.core.durable.committed[index] != null) continue;
-                    if (accepted) |entry| {
-                        switch (entry.value) {
-                            .command => {},
-                            .stop => {
-                                pending = true;
-                                break;
-                            },
-                        }
-                    }
-                }
-                for (self.core.proposals, 0..) |proposal, index| {
-                    if (self.core.durable.committed[index] != null) continue;
-                    if (proposal) |entry| {
-                        switch (entry) {
-                            .command => {},
-                            .stop => {
-                                pending = true;
-                                break;
-                            },
-                        }
-                    }
-                }
-                self.stop_pending = pending;
+                self.stop_pending = self.pendingStopSign() != null;
             }
 
             fn observeEffects(self: *Node, effects: *const Effects) void {
@@ -484,13 +461,13 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             }
 
             fn observeDurable(self: *Node) void {
-                for (self.core.durable.committed, 0..) |committed, index| {
-                    const entry = committed orelse continue;
+                for (&self.core.durable.cells) |*cell| {
+                    const entry = cell.committed orelse continue;
                     switch (entry) {
                         .command => {},
                         .stop => |stop| {
                             self.stop_sign = stop;
-                            self.stop_slot = @intCast(index + 1);
+                            self.stop_slot = cell.slot;
                         },
                     }
                 }
@@ -503,7 +480,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
 test "a decided stop sign seals a configuration" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 3,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 2,
         .max_metadata_bytes = 16,
     });
@@ -528,7 +505,7 @@ test "a decided stop sign seals a configuration" {
 test "a decided stop sign starts a changed-member configuration" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 3,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 2,
         .max_metadata_bytes = 16,
     });
@@ -573,7 +550,7 @@ test "a decided stop sign starts a changed-member configuration" {
 test "restore recovers the decided stop slot" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 3,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 2,
         .max_metadata_bytes = 16,
     });
@@ -602,7 +579,7 @@ test "restore recovers the decided stop slot" {
 test "stop sign member validation is reusable by host decoders" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 3,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 2,
     });
     try Log.StopSign.validateMembers(&.{ 1, 2, 3 });
@@ -627,7 +604,7 @@ test "stop sign member validation is reusable by host decoders" {
 test "replicated log batches commands without allocation" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 1,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 3,
     });
     var membership: Log.Membership = undefined;
@@ -647,7 +624,7 @@ test "replicated log batches commands without allocation" {
 test "checkpoint seals an epoch and initializes the next one" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 1,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 4,
         .max_metadata_bytes = 16,
     });
@@ -671,7 +648,7 @@ test "checkpoint seals an epoch and initializes the next one" {
 test "replicated log learner observes a chosen stop sign" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 3,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 2,
     });
     var membership: Log.Membership = undefined;
@@ -693,7 +670,7 @@ test "replicated log learner observes a chosen stop sign" {
 test "restore remains sealed after accepting a stop sign" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 3,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 4,
         .max_metadata_bytes = 8,
     });
@@ -718,7 +695,7 @@ test "restore remains sealed after accepting a stop sign" {
 test "restore does not remain sealed if proposed stop sign was overwritten" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 3,
-        .max_entries = 4,
+        .window_slots = 4,
         .max_batch = 4,
         .max_metadata_bytes = 8,
     });

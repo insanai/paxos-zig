@@ -34,7 +34,7 @@ pub fn Protocol(comptime Value: type, comptime options: Options) type {
 }
 
 test "host-managed hosts may batch messages before confirming durability" {
-    const P = Protocol(u64, .{ .max_members = 3, .max_slots = 16 });
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 16 });
     var membership: P.Membership = undefined;
     try membership.init(&.{ 1, 2, 3 });
     var node: P.Node = undefined;

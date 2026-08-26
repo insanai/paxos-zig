@@ -5,7 +5,7 @@
 const std = @import("std");
 const paxos = @import("paxos");
 
-const P = paxos.Protocol(u64, .{ .max_members = 3, .max_slots = 16 });
+const P = paxos.Protocol(u64, .{ .max_members = 3, .window_slots = 16 });
 
 pub fn main() !void {
     var membership: P.Membership = undefined;

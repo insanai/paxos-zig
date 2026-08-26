@@ -21,8 +21,11 @@ pub const Slot = u64;
 pub const Options = struct {
     /// Maximum members represented by fixed arrays.
     max_members: usize = 7,
-    /// Maximum slots retained by this protocol instance.
-    max_slots: usize = 256,
+    /// Power-of-two count of physical consensus cells. The window bounds
+    /// concurrent unresolved and locally cached instances, not lifetime
+    /// history: a cell is retagged for a later slot once its occupant is
+    /// chosen and released below the memory floor (ZDS 0011).
+    window_slots: usize = 256,
     /// Phase one quorum, or a majority when null.
     read_quorum_size: ?u16 = null,
     /// Phase two quorum, or a majority when null.
@@ -101,8 +104,11 @@ pub fn ProtocolGated(
         if (options.max_members == 0) {
             @compileError("paxos Protocol option max_members must be greater than zero");
         }
-        if (options.max_slots == 0) {
-            @compileError("paxos Protocol option max_slots must be greater than zero");
+        if (options.window_slots == 0) {
+            @compileError("paxos Protocol option window_slots must be greater than zero");
+        }
+        if (!std.math.isPowerOfTwo(options.window_slots)) {
+            @compileError("paxos Protocol option window_slots must be a power of two");
         }
         if (options.max_members > std.math.maxInt(u16)) {
             @compileError("paxos Protocol option max_members must be at most 65535");
@@ -117,15 +123,16 @@ pub fn ProtocolGated(
         if (options.resend_interval_ticks == 0) {
             @compileError("paxos Protocol option resend_interval_ticks must be greater than zero");
         }
-        const wide_messages = @as(u128, options.max_members) * options.max_slots +
+        const wide_messages = @as(u128, options.max_members) * options.window_slots +
             options.max_members + 1;
         if (wide_messages > std.math.maxInt(usize)) {
-            @compileError("paxos Protocol options max_members and max_slots overflow " ++
+            @compileError("paxos Protocol options max_members and window_slots overflow " ++
                 "the derived message capacity");
         }
-        const wide_writes = @as(u128, options.max_slots) * 2 + 1;
+        const wide_writes = @as(u128, options.window_slots) * 2 + 1;
         if (wide_writes > std.math.maxInt(usize)) {
-            @compileError("paxos Protocol option max_slots overflows the derived write capacity");
+            @compileError("paxos Protocol option window_slots overflows " ++
+                "the derived write capacity");
         }
         if (hasPointers(Value)) {
             @compileError(
@@ -135,11 +142,12 @@ pub fn ProtocolGated(
         }
     }
 
-    const max_messages = options.max_members * options.max_slots + options.max_members + 1;
+    const max_messages = options.max_members * options.window_slots + options.max_members + 1;
     // A one-node quorum can accept and commit every recovered slot in one step.
-    const max_writes = options.max_slots * 2 + 1;
+    const max_writes = options.window_slots * 2 + 1;
     const MemberSet = BitSet(options.max_members);
-    const SlotSet = BitSet(options.max_slots);
+    const SlotSet = BitSet(options.window_slots);
+    const window_mask: Slot = options.window_slots - 1;
 
     return struct {
         const Self = @This();
@@ -150,6 +158,21 @@ pub fn ProtocolGated(
         pub const Accepted = struct {
             ballot: Ballot,
             value: Value,
+        };
+
+        /// One tagged phase-one recovery cell: the highest-ballot vote seen
+        /// for its slot across the promise quorum.
+        const RecoveredCell = struct {
+            slot: Slot = 0,
+            accepted: ?Accepted = null,
+        };
+
+        /// One tagged leader bookkeeping cell: the value this leader drives
+        /// for its slot and the durable acknowledgements collected for it.
+        const LeadCell = struct {
+            slot: Slot = 0,
+            proposal: ?Value = null,
+            acknowledgements: MemberSet = .{},
         };
 
         /// Fixed voting membership and validated quorum sizes.
@@ -332,7 +355,7 @@ pub fn ProtocolGated(
             writes_count: usize = 0,
             messages: [max_messages]Envelope = undefined,
             messages_count: usize = 0,
-            committed: [options.max_slots]Committed = undefined,
+            committed: [options.window_slots]Committed = undefined,
             committed_count: usize = 0,
             writes_confirmed: bool = true,
 
@@ -468,16 +491,56 @@ pub fn ProtocolGated(
             }
         };
 
+        /// One physical consensus cell. Valid only for the slot stored in its
+        /// tag: a lookup for slot `s` succeeds only when `slot == s`, so a
+        /// reused cell can never answer for its former occupant (ZDS 0011,
+        /// tagged-cell non-aliasing). A zero tag marks an empty cell.
+        pub const DurableCell = struct {
+            slot: Slot = 0,
+            accepted: ?Accepted = null,
+            committed: ?Value = null,
+        };
+
         /// Durable acceptor and learner state reconstructed by journal replay.
         pub const DurableState = struct {
             promised: Ballot = Ballot.zero,
-            accepted: [options.max_slots]?Accepted = [_]?Accepted{null} ** options.max_slots,
-            committed: [options.max_slots]?Value = [_]?Value{null} ** options.max_slots,
+            cells: [options.window_slots]DurableCell =
+                [_]DurableCell{.{}} ** options.window_slots,
+
+            /// Returns the durable vote for `slot`, if its cell still holds it.
+            pub fn acceptedAt(self: *const DurableState, slot: Slot) ?Accepted {
+                if (slot == 0) return null;
+                const cell = &self.cells[cellIndex(slot)];
+                return if (cell.slot == slot) cell.accepted else null;
+            }
+
+            /// Returns the committed value for `slot`, if its cell still holds it.
+            pub fn committedAt(self: *const DurableState, slot: Slot) ?Value {
+                if (slot == 0) return null;
+                const cell = &self.cells[cellIndex(slot)];
+                return if (cell.slot == slot) cell.committed else null;
+            }
+
+            /// Claims the physical cell for `slot`: an empty cell is tagged,
+            /// the slot's own cell is returned unchanged, and a cell still
+            /// occupied by a different slot returns null.
+            fn claim(self: *DurableState, slot: Slot) ?*DurableCell {
+                const cell = &self.cells[cellIndex(slot)];
+                if (cell.slot == slot) return cell;
+                if (cell.slot == 0) {
+                    cell.* = .{ .slot = slot };
+                    return cell;
+                }
+                return null;
+            }
 
             /// Replays one journal record in original write order. Regressed
             /// promises and conflicting values are reported as errors, not
             /// repaired: a journal that violates durable monotonicity is
-            /// corrupt, and the node must stop rather than vote from it.
+            /// corrupt, and the node must stop rather than vote from it. A
+            /// record whose physical cell is still occupied by another slot
+            /// means the journal ran past the window without an anchor, which
+            /// is equally corrupt.
             pub fn apply(self: *DurableState, write: Write) !void {
                 self.assertValid();
                 switch (write) {
@@ -486,11 +549,13 @@ pub fn ProtocolGated(
                         self.promised = ballot;
                     },
                     .accept => |accepted| {
-                        const index = try slotIndex(accepted.slot);
+                        if (accepted.slot == 0) return error.InvalidSlot;
                         if (accepted.ballot.lessThan(self.promised)) {
                             return error.PromiseRegression;
                         }
-                        if (self.accepted[index]) |stored| {
+                        const cell = self.claim(accepted.slot) orelse
+                            return error.WindowOverrun;
+                        if (cell.accepted) |stored| {
                             if (stored.ballot.eql(accepted.ballot) and
                                 !std.meta.eql(stored.value, accepted.value))
                             {
@@ -498,21 +563,23 @@ pub fn ProtocolGated(
                             }
                         }
                         self.promised = accepted.ballot;
-                        self.accepted[index] = .{
+                        cell.accepted = .{
                             .ballot = accepted.ballot,
                             .value = accepted.value,
                         };
                     },
                     .commit => |committed| {
-                        const index = try slotIndex(committed.slot);
-                        if (self.committed[index]) |value| {
+                        if (committed.slot == 0) return error.InvalidSlot;
+                        const cell = self.claim(committed.slot) orelse
+                            return error.WindowOverrun;
+                        if (cell.committed) |value| {
                             if (!std.meta.eql(value, committed.value)) {
                                 return error.ConflictingCommit;
                             }
                         }
                         // A vote for another value may coexist with the
                         // commit; see `recordCommit` for why that is legal.
-                        self.committed[index] = committed.value;
+                        cell.committed = committed.value;
                     },
                 }
                 self.assertValid();
@@ -520,8 +587,11 @@ pub fn ProtocolGated(
 
             fn assertValid(self: *const DurableState) void {
                 if (!std.debug.runtime_safety) return;
-                for (self.accepted) |accepted| {
-                    if (accepted) |value| {
+                for (self.cells, 0..) |cell, index| {
+                    if (cell.slot != 0) {
+                        std.debug.assert(cellIndex(cell.slot) == index);
+                    }
+                    if (cell.accepted) |value| {
                         std.debug.assert(!self.promised.lessThan(value.ballot));
                     }
                 }
@@ -565,12 +635,16 @@ pub fn ProtocolGated(
                 [_]Slot{0} ** options.max_members,
             promise_seen: [options.max_members]SlotSet =
                 [_]SlotSet{.{}} ** options.max_members,
-            recovered: [options.max_slots]?Accepted =
-                [_]?Accepted{null} ** options.max_slots,
-            proposals: [options.max_slots]?Value =
-                [_]?Value{null} ** options.max_slots,
-            acknowledgements: [options.max_slots]MemberSet =
-                [_]MemberSet{.{}} ** options.max_slots,
+            recovered: [options.window_slots]RecoveredCell =
+                [_]RecoveredCell{.{}} ** options.window_slots,
+            lead: [options.window_slots]LeadCell =
+                [_]LeadCell{.{}} ** options.window_slots,
+
+            /// The greatest slot whose cell the host has released for reuse.
+            /// Fixed at zero until eviction ships with the bounded phase one
+            /// (ZDS 0011); the occupancy check `next_slot - memory_floor`
+            /// already expresses window backpressure in terms of it.
+            memory_floor: Slot = 0,
 
             /// Initializes a member with priority zero.
             pub fn init(self: *Node, id: NodeId, membership: *const Membership) !void {
@@ -643,7 +717,7 @@ pub fn ProtocolGated(
             ) !void {
                 try self.initWithPriority(id, membership, leader_priority);
                 self.durable = durable.*;
-                self.next_slot = slotAfter(self.highestUsedSlot());
+                self.next_slot = self.highestUsedSlot() + 1;
                 self.assertValid();
             }
 
@@ -656,7 +730,7 @@ pub fn ProtocolGated(
             ) !void {
                 try self.initLearner(id, membership);
                 self.durable = durable.*;
-                self.next_slot = slotAfter(self.highestUsedSlot());
+                self.next_slot = self.highestUsedSlot() + 1;
                 self.assertValid();
             }
 
@@ -685,11 +759,13 @@ pub fn ProtocolGated(
                 effects.reset();
                 if (!self.voting_member) return error.NotVoter;
                 if (self.role != .leader) return error.NotLeader;
-                if (self.next_slot == 0) return error.SlotLimitReached;
+                if (self.next_slot == std.math.maxInt(Slot)) return error.GlobalSlotExhausted;
+                if (self.next_slot - self.memory_floor > options.window_slots) {
+                    return error.WindowFull;
+                }
 
                 const slot = self.next_slot;
-                _ = try slotIndex(slot);
-                self.next_slot = slotAfter(slot);
+                self.next_slot = slot + 1;
                 try self.sendAccept(slot, value, effects);
                 self.assertValid();
                 return slot;
@@ -708,15 +784,17 @@ pub fn ProtocolGated(
                 if (self.role != .leader) return error.NotLeader;
                 if (values.len == 0) return error.EmptyBatch;
                 if (slots.len < values.len) return error.SlotBufferTooSmall;
-                if (self.next_slot == 0) return error.SlotLimitReached;
+                if (values.len > std.math.maxInt(Slot) - self.next_slot) {
+                    return error.GlobalSlotExhausted;
+                }
 
-                const first_index = try slotIndex(self.next_slot);
-                const remaining = options.max_slots - first_index;
-                if (values.len > remaining) return error.SlotLimitReached;
+                const occupied: Slot = self.next_slot - 1 - self.memory_floor;
+                const free: Slot = @as(Slot, options.window_slots) - occupied;
+                if (values.len > free) return error.WindowFull;
 
                 for (values, slots[0..values.len]) |value, *slot| {
                     slot.* = self.next_slot;
-                    self.next_slot = slotAfter(self.next_slot);
+                    self.next_slot += 1;
                     try self.sendAccept(slot.*, value, effects);
                 }
                 self.assertValid();
@@ -754,10 +832,8 @@ pub fn ProtocolGated(
                 if (self.role == .leader) {
                     self.resendTo(peer, effects);
                 } else if (self.leader_hint == peer) {
-                    const from_slot = slotAfter(self.delivered_through);
-                    if (from_slot == 0) return;
                     self.sendTo(peer, effects, .{ .learn = .{
-                        .from_slot = from_slot,
+                        .from_slot = self.delivered_through + 1,
                     } });
                 }
                 self.assertValid();
@@ -868,11 +944,13 @@ pub fn ProtocolGated(
                 self.assertValid();
             }
 
-            /// Returns a learned value, or null for an undecided or invalid slot.
+            /// Returns a learned value, or null for an undecided or invalid
+            /// slot. A slot whose cell was reused below the memory floor
+            /// returns null; the host recovers released history from its own
+            /// journal or materialized state.
             pub fn committedAt(self: *const Node, slot: Slot) ?Value {
                 self.assertValid();
-                const index = slotIndex(slot) catch return null;
-                return self.durable.committed[index];
+                return self.durable.committedAt(slot);
             }
 
             /// Returns the last observed leader, if any.
@@ -917,8 +995,11 @@ pub fn ProtocolGated(
                 }
                 std.debug.assert(self.membership.count > 0);
                 std.debug.assert(self.membership.count <= options.max_members);
-                std.debug.assert(self.next_slot <= options.max_slots);
-                std.debug.assert(self.delivered_through <= options.max_slots);
+                std.debug.assert(self.next_slot >= 1);
+                std.debug.assert(self.next_slot - 1 <=
+                    self.memory_floor + options.window_slots);
+                std.debug.assert(self.delivered_through <=
+                    self.memory_floor + options.window_slots);
 
                 self.durable.assertValid();
             }
@@ -983,10 +1064,8 @@ pub fn ProtocolGated(
                 if (self.ballot.lessThan(ballot)) self.role = .follower;
 
                 var accepted_count: Slot = 0;
-                var slot = decided_through + 1;
-                while (slot <= options.max_slots) {
-                    std.debug.assert(slot > 0);
-                    const index = @as(usize, slot - 1);
+                for (&self.durable.cells) |*cell| {
+                    if (cell.slot == 0 or cell.slot <= decided_through) continue;
                     // Report this slot's vote. A decree that was learned
                     // without voting still travels as a zero-ballot vote:
                     // the paper's parliamentary protocol has legislators
@@ -994,9 +1073,9 @@ pub fn ProtocolGated(
                     // reply so a president behind on the log recovers them.
                     // A zero ballot loses to every real vote, so it can
                     // never override the choosing quorum's value.
-                    var known = self.durable.accepted[index];
+                    var known = cell.accepted;
                     if (known == null) {
-                        if (self.durable.committed[index]) |value| {
+                        if (cell.committed) |value| {
                             known = .{ .ballot = Ballot.zero, .value = value };
                         }
                     }
@@ -1007,13 +1086,11 @@ pub fn ProtocolGated(
                             .to = from,
                             .message = .{ .promise = .{
                                 .ballot = ballot,
-                                .slot = slot,
+                                .slot = cell.slot,
                                 .accepted = value,
                             } },
                         });
                     }
-                    if (slot == options.max_slots) break;
-                    slot = slotAfter(slot);
                 }
                 effects.addMessage(.{
                     .from = self.id,
@@ -1036,19 +1113,29 @@ pub fn ProtocolGated(
             ) !void {
                 if (self.role != .preparing) return;
                 if (!message.ballot.eql(self.ballot)) return;
+                if (message.slot == 0) return;
 
                 const member = self.membership.indexOf(from) orelse return;
-                const index = slotIndex(message.slot) catch return;
+                const index = cellIndex(message.slot);
                 if (self.promise_seen[member].insert(index)) {
                     self.promise_received[member] += 1;
                 }
 
-                if (self.recovered[index]) |recovered| {
+                const cell = &self.recovered[index];
+                // Every promise reports live cells only, so within one
+                // election all reported slots occupy distinct physical
+                // indexes; a cross-slot collision would need per-member
+                // window skew, which requires the memory floor to move.
+                std.debug.assert(cell.slot == 0 or cell.slot == message.slot);
+                if (cell.slot != message.slot) {
+                    cell.* = .{ .slot = message.slot };
+                }
+                if (cell.accepted) |recovered| {
                     if (recovered.ballot.lessThan(message.accepted.ballot)) {
-                        self.recovered[index] = message.accepted;
+                        cell.accepted = message.accepted;
                     }
                 } else {
-                    self.recovered[index] = message.accepted;
+                    cell.accepted = message.accepted;
                 }
                 try self.maybeBecomeLeader(effects);
             }
@@ -1061,7 +1148,7 @@ pub fn ProtocolGated(
             ) !void {
                 if (self.role != .preparing) return;
                 if (!message.ballot.eql(self.ballot)) return;
-                if (message.accepted_count > options.max_slots) return error.InvalidPromise;
+                if (message.accepted_count > options.window_slots) return error.InvalidPromise;
 
                 const member = self.membership.indexOf(from) orelse return;
                 self.promise_done[member] = true;
@@ -1087,26 +1174,22 @@ pub fn ProtocolGated(
                 self.leader_hint = self.id;
 
                 const highest = self.highestRecoveredSlot();
-                var slot: Slot = 1;
-                while (slot <= highest) {
-                    std.debug.assert(slot > 0);
-                    const index = try slotIndex(slot);
-                    if (self.durable.committed[index]) |value| {
+                var slot: Slot = self.memory_floor + 1;
+                while (slot <= highest) : (slot += 1) {
+                    if (self.durable.committedAt(slot)) |value| {
                         self.broadcastPeers(effects, .{ .commit = .{
                             .slot = slot,
                             .value = value,
                         } });
                     } else {
-                        const value = if (self.recovered[index]) |accepted|
+                        const value = if (self.recoveredAt(slot)) |accepted|
                             accepted.value
                         else
                             self.noop;
                         try self.sendAccept(slot, value, effects);
                     }
-                    if (slot == highest) break;
-                    slot = slotAfter(slot);
                 }
-                self.next_slot = slotAfter(highest);
+                self.next_slot = @max(self.next_slot, highest + 1);
                 // A leader restored from its journal re-releases its own
                 // contiguous committed prefix; peers hear the re-broadcast
                 // commits above, but nobody sends commits to the leader.
@@ -1121,13 +1204,18 @@ pub fn ProtocolGated(
                 message: Accept,
                 effects: *Effects,
             ) !void {
-                const index = try slotIndex(message.slot);
+                if (message.slot == 0) return error.InvalidSlot;
                 if (message.ballot.lessThan(self.durable.promised)) {
                     self.sendNack(from, message.ballot, effects);
                     return;
                 }
 
-                if (self.durable.accepted[index]) |accepted| {
+                // A slot whose physical cell still holds another live slot
+                // cannot vote yet; the request is dropped and the leader's
+                // resend recovers it after this node's window advances.
+                const cell = self.durable.claim(message.slot) orelse return;
+
+                if (cell.accepted) |accepted| {
                     if (accepted.ballot.eql(message.ballot)) {
                         if (!std.meta.eql(accepted.value, message.value)) {
                             return error.ConflictingValue;
@@ -1146,7 +1234,7 @@ pub fn ProtocolGated(
                 }
 
                 self.durable.promised = message.ballot;
-                self.durable.accepted[index] = .{
+                cell.accepted = .{
                     .ballot = message.ballot,
                     .value = message.value,
                 };
@@ -1177,16 +1265,18 @@ pub fn ProtocolGated(
             ) !void {
                 if (self.role != .leader) return;
                 if (!message.ballot.eql(self.ballot)) return;
+                if (message.slot == 0) return error.InvalidSlot;
 
-                const index = try slotIndex(message.slot);
+                const cell = &self.lead[cellIndex(message.slot)];
+                if (cell.slot != message.slot) return;
                 const member = self.membership.indexOf(from) orelse return;
-                _ = self.acknowledgements[index].insert(member);
-                if (self.acknowledgements[index].count() < self.membership.writeQuorum()) {
+                _ = cell.acknowledgements.insert(member);
+                if (cell.acknowledgements.count() < self.membership.writeQuorum()) {
                     return;
                 }
-                if (self.durable.committed[index] != null) return;
+                if (self.durable.committedAt(message.slot) != null) return;
 
-                const value = self.proposals[index] orelse return error.MissingProposedValue;
+                const value = cell.proposal orelse return error.MissingProposedValue;
 
                 try self.recordCommit(message.slot, value, effects);
                 self.broadcastPeers(effects, .{ .commit = .{
@@ -1230,8 +1320,16 @@ pub fn ProtocolGated(
             }
 
             fn recordCommit(self: *Node, slot: Slot, value: Value, effects: *Effects) !void {
-                const index = try slotIndex(slot);
-                if (self.durable.committed[index]) |committed| {
+                if (slot == 0) return error.InvalidSlot;
+                // A commit at or below the memory floor is a duplicate for a
+                // slot whose cell was already released: it was chosen and
+                // delivered, so there is nothing left to record.
+                if (slot <= self.memory_floor) return;
+                // A commit whose physical cell still holds an earlier live
+                // slot is dropped; delivery cannot pass the earlier slot
+                // anyway, and the commit is re-sent once the window advances.
+                const cell = self.durable.claim(slot) orelse return;
+                if (cell.committed) |committed| {
                     if (!std.meta.eql(committed, value)) return error.ConflictingCommit;
                     // A duplicate commit still releases the contiguous
                     // prefix: after a restart the replayed log is committed
@@ -1245,7 +1343,7 @@ pub fn ProtocolGated(
                 // authoritative; the stale vote stays and stays harmless
                 // because every read quorum intersects the choosing write
                 // quorum, whose higher-ballot votes carry the chosen value.
-                self.durable.committed[index] = value;
+                cell.committed = value;
                 effects.addWrite(.{ .commit = .{
                     .slot = slot,
                     .value = value,
@@ -1254,15 +1352,11 @@ pub fn ProtocolGated(
             }
 
             fn emitContiguous(self: *Node, effects: *Effects) void {
-                var slot = self.delivered_through + 1;
-                while (slot <= options.max_slots) {
-                    std.debug.assert(slot > 0);
-                    const index = @as(usize, slot - 1);
-                    const value = self.durable.committed[index] orelse break;
-                    effects.addCommitted(.{ .slot = slot, .value = value });
-                    self.delivered_through = slot;
-                    if (slot == options.max_slots) break;
-                    slot = slotAfter(slot);
+                while (true) {
+                    const next = self.delivered_through + 1;
+                    const value = self.durable.committedAt(next) orelse break;
+                    effects.addCommitted(.{ .slot = next, .value = value });
+                    self.delivered_through = next;
                 }
             }
 
@@ -1273,22 +1367,18 @@ pub fn ProtocolGated(
                 effects: *Effects,
             ) !void {
                 if (from_slot == 0) return error.InvalidSlot;
-                var slot = from_slot;
-                while (slot <= options.max_slots) {
-                    std.debug.assert(slot > 0);
-                    const index = @as(usize, slot - 1);
-                    if (self.durable.committed[index]) |value| {
+                for (&self.durable.cells) |*cell| {
+                    if (cell.slot == 0 or cell.slot < from_slot) continue;
+                    if (cell.committed) |value| {
                         effects.addMessage(.{
                             .from = self.id,
                             .to = from,
                             .message = .{ .commit = .{
-                                .slot = slot,
+                                .slot = cell.slot,
                                 .value = value,
                             } },
                         });
                     }
-                    if (slot == options.max_slots) break;
-                    slot = slotAfter(slot);
                 }
             }
 
@@ -1310,16 +1400,25 @@ pub fn ProtocolGated(
                 value: Value,
                 effects: *Effects,
             ) !void {
-                const index = try slotIndex(slot);
-                if (self.proposals[index]) |proposed| {
-                    if (!std.meta.eql(proposed, value)) return error.ConflictingValue;
+                std.debug.assert(slot != 0);
+                const lead = &self.lead[cellIndex(slot)];
+                if (lead.slot == slot) {
+                    if (lead.proposal) |proposed| {
+                        if (!std.meta.eql(proposed, value)) return error.ConflictingValue;
+                    }
+                } else {
+                    lead.* = .{ .slot = slot };
                 }
-                self.proposals[index] = value;
-                self.acknowledgements[index] = .{};
+                lead.proposal = value;
+                lead.acknowledgements = .{};
 
                 std.debug.assert(!self.ballot.lessThan(self.durable.promised));
                 self.durable.promised = self.ballot;
-                self.durable.accepted[index] = .{
+                // The occupancy check in `propose` and the recovery bound in
+                // `maybeBecomeLeader` keep every driven slot inside the
+                // window, so the leader's own claim cannot fail.
+                const cell = self.durable.claim(slot) orelse return error.WindowOverrun;
+                cell.accepted = .{
                     .ballot = self.ballot,
                     .value = value,
                 };
@@ -1330,7 +1429,7 @@ pub fn ProtocolGated(
                 } });
 
                 const local_member = self.membership.indexOf(self.id).?;
-                _ = self.acknowledgements[index].insert(local_member);
+                _ = lead.acknowledgements.insert(local_member);
                 if (self.membership.quorum() == 1) {
                     try self.recordCommit(slot, value, effects);
                 }
@@ -1380,25 +1479,32 @@ pub fn ProtocolGated(
                 const peer_idx = self.membership.indexOf(peer) orelse return;
                 const peer_decided = self.peer_decided_through[peer_idx];
 
-                var slot = peer_decided + 1;
-                while (slot <= options.max_slots) {
-                    std.debug.assert(slot > 0);
-                    const index = @as(usize, slot - 1);
-                    if (self.durable.committed[index]) |value| {
+                for (0..options.window_slots) |index| {
+                    const cell = &self.durable.cells[index];
+                    if (cell.slot == 0 or cell.slot <= peer_decided) continue;
+                    if (cell.committed) |value| {
                         self.sendTo(peer, effects, .{ .commit = .{
-                            .slot = slot,
+                            .slot = cell.slot,
                             .value = value,
                         } });
-                    } else if (self.proposals[index]) |value| {
+                    } else if (self.leadProposalAt(cell.slot)) |value| {
                         self.sendTo(peer, effects, .{ .accept = .{
                             .ballot = self.ballot,
-                            .slot = slot,
+                            .slot = cell.slot,
                             .value = value,
                         } });
                     }
-                    if (slot == options.max_slots) break;
-                    slot = slotAfter(slot);
                 }
+            }
+
+            fn leadProposalAt(self: *const Node, slot: Slot) ?Value {
+                const cell = &self.lead[cellIndex(slot)];
+                return if (cell.slot == slot) cell.proposal else null;
+            }
+
+            fn recoveredAt(self: *const Node, slot: Slot) ?Accepted {
+                const cell = &self.recovered[cellIndex(slot)];
+                return if (cell.slot == slot) cell.accepted else null;
             }
 
             fn sendTo(
@@ -1432,42 +1538,36 @@ pub fn ProtocolGated(
                 self.promise_expected = [_]Slot{0} ** options.max_members;
                 self.promise_received = [_]Slot{0} ** options.max_members;
                 self.promise_seen = [_]SlotSet{.{}} ** options.max_members;
-                self.recovered = [_]?Accepted{null} ** options.max_slots;
-                self.proposals = [_]?Value{null} ** options.max_slots;
+                self.recovered = [_]RecoveredCell{.{}} ** options.window_slots;
+                self.lead = [_]LeadCell{.{}} ** options.window_slots;
             }
 
             fn highestRecoveredSlot(self: *const Node) Slot {
                 var result: Slot = 0;
-                for (self.recovered, 0..) |accepted, index| {
-                    if (accepted != null) result = @intCast(index + 1);
+                for (&self.recovered) |*cell| {
+                    if (cell.accepted != null) result = @max(result, cell.slot);
                 }
-                for (self.durable.committed, 0..) |committed, index| {
-                    if (committed != null) result = @max(result, @as(Slot, @intCast(index + 1)));
+                for (&self.durable.cells) |*cell| {
+                    if (cell.committed != null) result = @max(result, cell.slot);
                 }
                 return result;
             }
 
             fn highestUsedSlot(self: *const Node) Slot {
                 var result: Slot = 0;
-                for (self.durable.accepted, 0..) |accepted, index| {
-                    if (accepted != null) result = @intCast(index + 1);
-                }
-                for (self.durable.committed, 0..) |committed, index| {
-                    if (committed != null) result = @max(result, @as(Slot, @intCast(index + 1)));
+                for (&self.durable.cells) |*cell| {
+                    if (cell.accepted != null or cell.committed != null) {
+                        result = @max(result, cell.slot);
+                    }
                 }
                 return result;
             }
         };
 
-        fn slotIndex(slot: Slot) !usize {
-            if (slot == 0) return error.InvalidSlot;
-            if (slot > options.max_slots) return error.SlotLimitReached;
-            return @intCast(slot - 1);
-        }
-
-        fn slotAfter(slot: Slot) Slot {
-            if (slot >= options.max_slots) return 0;
-            return slot + 1;
+        /// Physical cell index for a slot: `slot & (W - 1)`. The power-of-two
+        /// window makes this a mask, never a division.
+        fn cellIndex(slot: Slot) usize {
+            return @intCast(slot & window_mask);
         }
 
         fn extractDecidedThrough(message: Message) ?Slot {
@@ -1500,7 +1600,7 @@ test "ballots are ordered lexicographically" {
 }
 
 test "membership rejects invalid configurations" {
-    const P = Protocol(u64, .{ .max_members = 3, .max_slots = 8 });
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 8 });
     var membership: P.Membership = undefined;
     try std.testing.expectError(error.EmptyMembership, membership.init(&.{}));
     try std.testing.expectError(error.InvalidNodeId, membership.init(&.{ 1, 0 }));
@@ -1508,7 +1608,7 @@ test "membership rejects invalid configurations" {
 }
 
 test "acceptor-only member never campaigns but still promises" {
-    const P = Protocol(u64, .{ .max_members = 3, .max_slots = 4 });
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 4 });
     var membership: P.Membership = undefined;
     try membership.init(&.{ 1, 2, 3 });
     var node: P.Node = undefined;
@@ -1535,7 +1635,7 @@ test "acceptor-only member never campaigns but still promises" {
 }
 
 test "non-voting learner records only host-certified chosen values" {
-    const P = Protocol(u64, .{ .max_members = 3, .max_slots = 4 });
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 4 });
     var membership: P.Membership = undefined;
     try membership.init(&.{ 1, 2, 3 });
     var learner: P.Node = undefined;
@@ -1562,7 +1662,7 @@ test "non-voting learner records only host-certified chosen values" {
 test "flexible read and write quorums must intersect" {
     const Valid = Protocol(u64, .{
         .max_members = 5,
-        .max_slots = 8,
+        .window_slots = 8,
         .read_quorum_size = 4,
         .write_quorum_size = 2,
     });
@@ -1573,7 +1673,7 @@ test "flexible read and write quorums must intersect" {
 
     const Invalid = Protocol(u64, .{
         .max_members = 5,
-        .max_slots = 8,
+        .window_slots = 8,
         .read_quorum_size = 2,
         .write_quorum_size = 3,
     });
@@ -1584,7 +1684,7 @@ test "flexible read and write quorums must intersect" {
     );
 }
 
-const TestProtocol = Protocol(u64, .{ .max_members = 3, .max_slots = 16 });
+const TestProtocol = Protocol(u64, .{ .max_members = 3, .window_slots = 16 });
 const TestEnvelope = TestProtocol.Envelope;
 
 fn appendMessages(
@@ -1710,9 +1810,9 @@ test "phase one tolerates reordering and recovers the highest accepted value" {
     const higher = Ballot{ .round = 1, .node = 2 };
 
     var first_disk = TestProtocol.DurableState{ .promised = lower };
-    first_disk.accepted[0] = .{ .ballot = lower, .value = 77 };
+    first_disk.cells[1] = .{ .slot = 1, .accepted = .{ .ballot = lower, .value = 77 } };
     var second_disk = TestProtocol.DurableState{ .promised = higher };
-    second_disk.accepted[0] = .{ .ballot = higher, .value = 88 };
+    second_disk.cells[1] = .{ .slot = 1, .accepted = .{ .ballot = higher, .value = 88 } };
 
     var nodes: [3]TestProtocol.Node = undefined;
     try nodes[0].restore(1, &membership, &first_disk);
@@ -1771,8 +1871,8 @@ test "phase one tolerates reordering and recovers the highest accepted value" {
     try std.testing.expect(saw_recovered_accept);
 }
 
-test "bounded log reports exhaustion without reusing a slot" {
-    const P = Protocol(u64, .{ .max_members = 1, .max_slots = 1 });
+test "a full window reports transient backpressure without reusing a cell" {
+    const P = Protocol(u64, .{ .max_members = 1, .window_slots = 1 });
     var membership: P.Membership = undefined;
     try membership.init(&.{1});
     var node: P.Node = undefined;
@@ -1783,11 +1883,11 @@ test "bounded log reports exhaustion without reusing a slot" {
 
     try std.testing.expectEqual(@as(Slot, 1), try node.propose(1, &effects));
     effects.confirmWritesDurable();
-    try std.testing.expectError(error.SlotLimitReached, node.propose(2, &effects));
+    try std.testing.expectError(error.WindowFull, node.propose(2, &effects));
 }
 
 test "one-node quorum commits without a remote acknowledgement" {
-    const P = Protocol(u64, .{ .max_members = 1, .max_slots = 2 });
+    const P = Protocol(u64, .{ .max_members = 1, .window_slots = 2 });
     var membership: P.Membership = undefined;
     try membership.init(&.{1});
     var node: P.Node = undefined;
@@ -1803,7 +1903,7 @@ test "one-node quorum commits without a remote acknowledgement" {
 }
 
 test "batch proposal returns consecutive slots and one effect batch" {
-    const P = Protocol(u64, .{ .max_members = 1, .max_slots = 4 });
+    const P = Protocol(u64, .{ .max_members = 1, .window_slots = 4 });
     var membership: P.Membership = undefined;
     try membership.init(&.{1});
     var node: P.Node = undefined;
@@ -1822,7 +1922,7 @@ test "batch proposal returns consecutive slots and one effect batch" {
 test "tick starts an election and emits leader heartbeats" {
     const P = Protocol(u64, .{
         .max_members = 3,
-        .max_slots = 4,
+        .window_slots = 4,
         .election_timeout_ticks = 2,
         .heartbeat_interval_ticks = 2,
     });
@@ -1851,7 +1951,7 @@ test "tick starts an election and emits leader heartbeats" {
 }
 
 test "durable replay rejects conflicting values" {
-    const P = Protocol(u64, .{ .max_members = 1, .max_slots = 1 });
+    const P = Protocol(u64, .{ .max_members = 1, .window_slots = 1 });
     var durable = P.DurableState{};
     const ballot = Ballot{ .round = 1, .node = 1 };
     try durable.apply(.{ .accept = .{ .ballot = ballot, .slot = 1, .value = 7 } });
@@ -1909,7 +2009,7 @@ test "leader persists its local acceptance before remote acknowledgements" {
     }
 
     try std.testing.expectEqual(@as(?u64, 123), leader.committedAt(1));
-    try std.testing.expectEqual(@as(?u64, 123), leader.durable.accepted[0].?.value);
+    try std.testing.expectEqual(@as(?u64, 123), leader.durable.acceptedAt(1).?.value);
 }
 
 test "learners release commits only as a contiguous prefix" {
@@ -2026,9 +2126,9 @@ test "catch-up returns known commits from the requested slot" {
     try membership.init(&.{ 1, 2, 3 });
     var node: TestProtocol.Node = undefined;
     try node.init(1, &membership);
-    node.durable.committed[0] = 10;
-    node.durable.committed[1] = 20;
-    node.durable.committed[2] = 30;
+    node.durable.cells[1] = .{ .slot = 1, .committed = 10 };
+    node.durable.cells[2] = .{ .slot = 2, .committed = 20 };
+    node.durable.cells[3] = .{ .slot = 3, .committed = 30 };
     var effects = TestProtocol.Effects{};
 
     try node.step(.{
@@ -2050,8 +2150,12 @@ test "reconnected leader retransmits missing commits and open accepts" {
     leader.role = .leader;
     leader.ballot = .{ .round = 1, .node = 1 };
     leader.durable.promised = leader.ballot;
-    leader.durable.committed[0] = 10;
-    leader.proposals[1] = 20;
+    leader.durable.cells[1] = .{ .slot = 1, .committed = 10 };
+    leader.durable.cells[2] = .{ .slot = 2, .accepted = .{
+        .ballot = leader.ballot,
+        .value = 20,
+    } };
+    leader.lead[2] = .{ .slot = 2, .proposal = 20 };
     var effects = TestProtocol.Effects{};
 
     // The peer reported no progress, so it receives the decided slot as a
@@ -2079,7 +2183,7 @@ test "reconnected follower asks its leader for undelivered decisions" {
     var follower: TestProtocol.Node = undefined;
     try follower.init(2, &membership);
     follower.leader_hint = 1;
-    follower.durable.committed[0] = 10;
+    follower.durable.cells[1] = .{ .slot = 1, .committed = 10 };
     follower.delivered_through = 1;
     var effects = TestProtocol.Effects{};
 
@@ -2101,12 +2205,12 @@ test "requestCatchUp round trip returns decided entries from the slot" {
     try membership.init(&.{ 1, 2, 3 });
     var provider: TestProtocol.Node = undefined;
     try provider.init(1, &membership);
-    provider.durable.committed[0] = 10;
-    provider.durable.committed[1] = 20;
-    provider.durable.committed[2] = 30;
+    provider.durable.cells[1] = .{ .slot = 1, .committed = 10 };
+    provider.durable.cells[2] = .{ .slot = 2, .committed = 20 };
+    provider.durable.cells[3] = .{ .slot = 3, .committed = 30 };
     var lagging: TestProtocol.Node = undefined;
     try lagging.init(2, &membership);
-    lagging.durable.committed[0] = 10;
+    lagging.durable.cells[1] = .{ .slot = 1, .committed = 10 };
     lagging.delivered_through = 1;
     var effects = TestProtocol.Effects{};
 
@@ -2145,7 +2249,7 @@ test "requestCatchUp round trip returns decided entries from the slot" {
 test "resendIfDue retransmits to lagging peers after the resend interval" {
     const P = Protocol(u64, .{
         .max_members = 3,
-        .max_slots = 4,
+        .window_slots = 4,
         .election_timeout_ticks = 20,
         .heartbeat_interval_ticks = 16,
         .resend_interval_ticks = 2,
@@ -2157,8 +2261,12 @@ test "resendIfDue retransmits to lagging peers after the resend interval" {
     leader.role = .leader;
     leader.ballot = .{ .round = 1, .node = 1 };
     leader.durable.promised = leader.ballot;
-    leader.durable.committed[0] = 10;
-    leader.proposals[1] = 20;
+    leader.durable.cells[1] = .{ .slot = 1, .committed = 10 };
+    leader.durable.cells[2] = .{ .slot = 2, .accepted = .{
+        .ballot = leader.ballot,
+        .value = 20,
+    } };
+    leader.lead[2] = .{ .slot = 2, .proposal = 20 };
     var effects = P.Effects{};
 
     // Nothing is retransmitted before the interval of silence elapses.

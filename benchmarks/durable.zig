@@ -27,7 +27,7 @@ const record_size = 37;
 
 const P = paxos.host_managed.Protocol(u64, .{
     .max_members = node_count,
-    .max_slots = value_count,
+    .window_slots = value_count,
 });
 
 const bench_dir = ".zig-cache/durable-bench";
