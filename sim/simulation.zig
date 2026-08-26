@@ -33,6 +33,10 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
         pub const P = paxos.Protocol(u64, proto_options);
         const max_nodes = proto_options.max_members;
         const max_slots = proto_options.window_slots;
+        /// Absolute-slot capacity of the golden oracle. Slots are global
+        /// and outlive the window once floors advance; a bounded run stays
+        /// far below this, and exceeding it fails the run loudly.
+        const golden_capacity = 8_192;
         const journal_capacity = 16_384;
         const network_capacity = 2_048;
         const trace_capacity = 48;
@@ -85,7 +89,7 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
         cut_links: [max_nodes][max_nodes]bool,
         network: [network_capacity]P.Envelope,
         network_count: usize,
-        golden: [max_slots]?u64,
+        golden: [golden_capacity]?u64,
         issued: u64,
         step_index: u32,
         trace: [trace_capacity]Action,
@@ -122,7 +126,7 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
             }
             self.cut_links = [_][max_nodes]bool{[_]bool{false} ** max_nodes} ** max_nodes;
             self.network_count = 0;
-            self.golden = [_]?u64{null} ** max_slots;
+            self.golden = [_]?u64{null} ** golden_capacity;
             self.issued = 0;
             self.step_index = 0;
             self.trace_count = 0;
@@ -251,10 +255,14 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
                 };
             }
             try self.mergeGolden(&replayed);
-            self.nodes[index].restoreWithPriority(
+            // The host restores at its consumed floor: everything it ever
+            // saw released is journal-durable and processed, so cells below
+            // it may already be reused in the replayed window.
+            self.nodes[index].restoreAt(
                 @intCast(index + 1),
                 &self.membership,
                 &replayed,
+                self.shadow_decided[index],
                 self.config.priorities[index],
             ) catch |err| return self.fail("restore returned {t}", err);
             self.effects[index].init();
@@ -315,7 +323,49 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
             try self.persistWrites(index, effects.writesSlice().len);
             effects.confirmWritesDurable();
             self.enqueue(effects.messagesSlice());
+            self.serveRequests(index, effects.requestsSlice());
+            // Model the host consuming released entries and returning cells
+            // for reuse. The floor lags half the time, so a full window and
+            // the eviction guards are exercised, not just the happy path.
+            if (!self.chance(500)) {
+                const node = &self.nodes[index];
+                node.advanceMemoryFloor(node.decidedThrough()) catch |err| {
+                    return self.fail("advanceMemoryFloor returned {t}", err);
+                };
+            }
             return false;
+        }
+
+        /// The host side of `serve_range`: history below the memory floor
+        /// left the window, so commits are re-sent from the journal.
+        fn serveRequests(
+            self: *Self,
+            index: usize,
+            requests: []const P.HostRequest,
+        ) void {
+            for (requests) |request| {
+                const range = request.serve_range;
+                const limit = range.first + range.count - 1;
+                const journal = &self.journals[index];
+                for (journal.entries[0..journal.count]) |write| {
+                    switch (write) {
+                        .commit => |commit| {
+                            if (commit.slot < range.first or commit.slot > limit) {
+                                continue;
+                            }
+                            self.enqueue(&.{.{
+                                .from = @intCast(index + 1),
+                                .to = range.peer,
+                                .message = .{ .commit = .{
+                                    .slot = commit.slot,
+                                    .value = commit.value,
+                                } },
+                            }});
+                        },
+                        else => {},
+                    }
+                }
+            }
         }
 
         /// Models a crash at one of the three host commit points: before any
@@ -395,6 +445,9 @@ pub fn Simulator(comptime proto_options: paxos.Options) type {
         fn mergeGolden(self: *Self, durable: *const P.DurableState) !void {
             for (&durable.cells) |*cell| {
                 const value = cell.committed orelse continue;
+                if (cell.slot > golden_capacity) {
+                    return self.fail("slot {d} exceeds the golden oracle", cell.slot);
+                }
                 const slot_index: usize = @intCast(cell.slot - 1);
                 if (value != noop and value > self.issued) {
                     return self.fail("unproposed value committed in slot {d}", cell.slot);

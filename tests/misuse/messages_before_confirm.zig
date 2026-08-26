@@ -18,7 +18,7 @@ pub fn main() !void {
         .to = 2,
         .message = .{ .prepare = .{
             .ballot = .{ .round = 1, .node = 1 },
-            .decided_through = 0,
+            .first = 1,
         } },
     }, &effects);
     if (effects.writes_count == 0) return error.FixtureProducedNoWrites;

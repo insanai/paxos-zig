@@ -26,6 +26,10 @@ pub const Options = struct {
     /// history: a cell is retagged for a later slot once its occupant is
     /// chosen and released below the memory floor (ZDS 0011).
     window_slots: usize = 256,
+    /// Slots resolved per phase-one or catch-up exchange. Bounds every
+    /// recovery message and buffer by the chunk, never by history. Null
+    /// derives the chunk from the window: min(64, window_slots).
+    recovery_chunk_slots: ?usize = null,
     /// Phase one quorum, or a majority when null.
     read_quorum_size: ?u16 = null,
     /// Phase two quorum, or a majority when null.
@@ -110,6 +114,16 @@ pub fn ProtocolGated(
         if (!std.math.isPowerOfTwo(options.window_slots)) {
             @compileError("paxos Protocol option window_slots must be a power of two");
         }
+        if (options.recovery_chunk_slots) |chunk| {
+            if (chunk == 0) {
+                @compileError("paxos Protocol option recovery_chunk_slots " ++
+                    "must be greater than zero");
+            }
+            if (chunk > options.window_slots) {
+                @compileError("paxos Protocol option recovery_chunk_slots " ++
+                    "must not exceed window_slots");
+            }
+        }
         if (options.max_members > std.math.maxInt(u16)) {
             @compileError("paxos Protocol option max_members must be at most 65535");
         }
@@ -123,13 +137,15 @@ pub fn ProtocolGated(
         if (options.resend_interval_ticks == 0) {
             @compileError("paxos Protocol option resend_interval_ticks must be greater than zero");
         }
-        const wide_messages = @as(u128, options.max_members) * options.window_slots +
-            options.max_members + 1;
+        const bound_chunk: usize = options.recovery_chunk_slots orelse
+            @min(64, options.window_slots);
+        const wide_messages = @as(u128, options.max_members) * bound_chunk +
+            2 * options.max_members + 1;
         if (wide_messages > std.math.maxInt(usize)) {
             @compileError("paxos Protocol options max_members and window_slots overflow " ++
                 "the derived message capacity");
         }
-        const wide_writes = @as(u128, options.window_slots) * 2 + 1;
+        const wide_writes = @as(u128, bound_chunk) * 2 + 1;
         if (wide_writes > std.math.maxInt(usize)) {
             @compileError("paxos Protocol option window_slots overflows " ++
                 "the derived write capacity");
@@ -142,9 +158,17 @@ pub fn ProtocolGated(
         }
     }
 
-    const max_messages = options.max_members * options.window_slots + options.max_members + 1;
-    // A one-node quorum can accept and commit every recovered slot in one step.
-    const max_writes = options.window_slots * 2 + 1;
+    const chunk_slots: usize = options.recovery_chunk_slots orelse
+        @min(64, options.window_slots);
+    // The largest transitions are chunk-bounded: resolving one recovery
+    // chunk broadcasts at most one accept per slot per peer plus a prepare
+    // continuation and a catch-up request; a resend tick emits at most one
+    // chunk per peer plus heartbeats.
+    const max_messages = options.max_members * chunk_slots +
+        2 * options.max_members + 1;
+    // A one-node quorum can accept and commit every slot of one chunk in
+    // one step, plus the promise record.
+    const max_writes = chunk_slots * 2 + 1;
     const MemberSet = BitSet(options.max_members);
     const SlotSet = BitSet(options.window_slots);
     const window_mask: Slot = options.window_slots - 1;
@@ -165,6 +189,21 @@ pub fn ProtocolGated(
         const RecoveredCell = struct {
             slot: Slot = 0,
             accepted: ?Accepted = null,
+        };
+
+        /// Per-member phase-one progress for the candidate's active chunk.
+        const ElectionPeer = struct {
+            anchor: TrimAnchor = .{},
+            chosen_through: Slot = 0,
+            /// The chunk this member is currently reporting; zero until its
+            /// `PromiseRange` for the active base arrives.
+            range_first: Slot = 0,
+            range_last: Slot = 0,
+            expected_in_range: u32 = 0,
+            received_in_range: u32 = 0,
+            range_described: bool = false,
+            /// Whether the member knows state above its answered chunk.
+            more: bool = false,
         };
 
         /// One tagged leader bookkeeping cell: the value this leader drives
@@ -239,30 +278,49 @@ pub fn ProtocolGated(
             }
         };
 
-        /// Phase one request (Lamport's NextBallot). `decided_through` is the
-        /// candidate's contiguous decided prefix; promisers report votes only
-        /// for slots above it, bounding the size of the reply stream.
-        pub const Prepare = struct { ballot: Ballot, decided_through: Slot };
-        /// Phase one reply carrying one slot's LastVote evidence. An acceptor
-        /// sends one promise per known slot above the candidate's decided
-        /// prefix and marks the end of the stream with `PromiseDone`. A decree
-        /// this node learned without ever voting travels as a zero-ballot
-        /// vote: it loses to every real vote, so it can never override the
-        /// choosing quorum's value, yet it lets a candidate that is behind on
-        /// the log recover already-committed decrees.
+        /// The chosen-trim anchor an acceptor answers Phase 1 with for its
+        /// released prefix: every slot at or below `chosen_trim_slot` is
+        /// chosen under `history_hash`, so its absence from the window can
+        /// never be read as an open instance (ZDS 0011). The core treats
+        /// the hash as opaque host evidence.
+        pub const TrimAnchor = struct {
+            trim_id: u64 = 0,
+            chosen_trim_slot: Slot = 0,
+            history_hash: [32]u8 = [_]u8{0} ** 32,
+        };
+
+        /// Phase one request (Lamport's NextBallot). `first` is the start
+        /// of the chunk the candidate wants resolved; acceptors answer one
+        /// bounded range and the candidate re-prepares with a higher
+        /// `first` to continue (equal ballots are re-promised without a
+        /// second durable write).
+        pub const Prepare = struct { ballot: Ballot, first: Slot };
+        /// Phase one reply carrying one slot's LastVote evidence. An
+        /// acceptor sends one promise per known slot inside the requested
+        /// chunk and describes the chunk with `PromiseRange`. A decree this
+        /// node learned without ever voting travels as a zero-ballot vote:
+        /// it loses to every real vote, so it can never override the
+        /// choosing quorum's value, yet it lets a candidate that is behind
+        /// on the log recover already-committed decrees.
         pub const Promise = struct {
             ballot: Ballot,
             slot: Slot,
             accepted: Accepted,
         };
-        /// Phase one completion marker. `accepted_count` is how many `Promise`
-        /// messages this acceptor sent for `ballot`, so the candidate can
-        /// recognize a complete promise set even when the network reorders
-        /// the marker ahead of the promises it counts.
-        pub const PromiseDone = struct {
+        /// Phase one chunk descriptor. The acceptor answered `[first, last]`
+        /// with `accepted_count` promises; `chosen_through` summarizes its
+        /// contiguous chosen prefix (whose values travel by catch-up, not
+        /// by vote), `anchor` its released trim prefix, and `more` whether
+        /// it knows state above `last`. Counting per chunk keeps the
+        /// exchange correct under reordering and duplication.
+        pub const PromiseRange = struct {
             ballot: Ballot,
-            accepted_count: Slot,
-            decided_through: Slot,
+            anchor: TrimAnchor,
+            chosen_through: Slot,
+            first: Slot,
+            last: Slot,
+            accepted_count: u32,
+            more: bool,
         };
         /// Phase two request (Lamport's BeginBallot): vote for `value` in
         /// `slot` unless a higher ballot has already been promised.
@@ -287,8 +345,10 @@ pub fn ProtocolGated(
             slot: Slot,
             value: Value,
         };
-        /// Catch-up request: send every known commit at or above `from_slot`.
-        pub const Learn = struct { from_slot: Slot };
+        /// Catch-up request: send known commits in the bounded range
+        /// `[from_slot, from_slot + count - 1]`. `count` never exceeds the
+        /// recovery chunk; the requester asks again as its prefix advances.
+        pub const Learn = struct { from_slot: Slot, count: u32 };
         /// Rejection of `rejected` by an acceptor already promised to
         /// `promised`. Nacks are a liveness aid only: they steer the loser
         /// back to follower and seed its next ballot round. Safety never
@@ -308,7 +368,7 @@ pub fn ProtocolGated(
         pub const Message = union(enum) {
             prepare: Prepare,
             promise: Promise,
-            promise_done: PromiseDone,
+            promise_range: PromiseRange,
             accept: Accept,
             accepted: AcceptedMessage,
             commit: Commit,
@@ -349,6 +409,17 @@ pub fn ProtocolGated(
             value: Value,
         };
 
+        /// A request the core cannot answer from its window and hands to
+        /// the host: serve journal history below the memory floor to a
+        /// peer as ordinary commit envelopes.
+        pub const HostRequest = union(enum) {
+            serve_range: struct {
+                peer: NodeId,
+                first: Slot,
+                count: u32,
+            },
+        };
+
         /// Caller-owned output buffers for one atomic protocol transition.
         pub const Effects = struct {
             writes: [max_writes]Write = undefined,
@@ -357,6 +428,8 @@ pub fn ProtocolGated(
             messages_count: usize = 0,
             committed: [options.window_slots]Committed = undefined,
             committed_count: usize = 0,
+            requests: [options.max_members]HostRequest = undefined,
+            requests_count: usize = 0,
             writes_confirmed: bool = true,
 
             /// Initializes only active counts, leaving large backing arrays untouched.
@@ -364,6 +437,7 @@ pub fn ProtocolGated(
                 self.writes_count = 0;
                 self.messages_count = 0;
                 self.committed_count = 0;
+                self.requests_count = 0;
                 self.writes_confirmed = true;
             }
 
@@ -384,6 +458,7 @@ pub fn ProtocolGated(
                 self.writes_count = 0;
                 self.messages_count = 0;
                 self.committed_count = 0;
+                self.requests_count = 0;
                 self.writes_confirmed = true;
             }
 
@@ -468,6 +543,18 @@ pub fn ProtocolGated(
                 return self.committed[0..self.committed_count];
             }
 
+            /// History the host must serve from its journal: the window no
+            /// longer holds these slots.
+            pub fn requestsSlice(self: *const Effects) []const HostRequest {
+                return self.requests[0..self.requests_count];
+            }
+
+            fn addRequest(self: *Effects, request: HostRequest) void {
+                std.debug.assert(self.requests_count < self.requests.len);
+                self.requests[self.requests_count] = request;
+                self.requests_count += 1;
+            }
+
             fn addWrite(self: *Effects, write: Write) void {
                 std.debug.assert(self.writes_count < self.writes.len);
                 self.writes[self.writes_count] = write;
@@ -521,13 +608,20 @@ pub fn ProtocolGated(
                 return if (cell.slot == slot) cell.committed else null;
             }
 
-            /// Claims the physical cell for `slot`: an empty cell is tagged,
-            /// the slot's own cell is returned unchanged, and a cell still
-            /// occupied by a different slot returns null.
+            /// Claims the physical cell for `slot` during journal replay: an
+            /// empty cell is tagged, the slot's own cell is returned
+            /// unchanged, and a committed older occupant is retagged. The
+            /// journal wrote the later record only after live eviction was
+            /// legal, so replay may retag without knowing the old floor; an
+            /// accepted-only occupant still fails, because eviction never
+            /// erases an open vote. Live paths go through `Node.claimLive`,
+            /// which additionally requires the occupant below the floor.
             fn claim(self: *DurableState, slot: Slot) ?*DurableCell {
                 const cell = &self.cells[cellIndex(slot)];
                 if (cell.slot == slot) return cell;
-                if (cell.slot == 0) {
+                if (cell.slot == 0 or
+                    (cell.slot < slot and cell.committed != null))
+                {
                     cell.* = .{ .slot = slot };
                     return cell;
                 }
@@ -570,8 +664,10 @@ pub fn ProtocolGated(
                     },
                     .commit => |committed| {
                         if (committed.slot == 0) return error.InvalidSlot;
-                        const cell = self.claim(committed.slot) orelse
-                            return error.WindowOverrun;
+                        // A commit whose cell is owned by a later slot was
+                        // passed through to the host at delivery time; the
+                        // window never held it and replay skips it.
+                        const cell = self.claim(committed.slot) orelse return;
                         if (cell.committed) |value| {
                             if (!std.meta.eql(value, committed.value)) {
                                 return error.ConflictingCommit;
@@ -627,24 +723,26 @@ pub fn ProtocolGated(
 
             noop: Value = undefined,
             noop_set: bool = false,
-            promise_done: [options.max_members]bool =
-                [_]bool{false} ** options.max_members,
-            promise_expected: [options.max_members]Slot =
-                [_]Slot{0} ** options.max_members,
-            promise_received: [options.max_members]Slot =
-                [_]Slot{0} ** options.max_members,
+            election: [options.max_members]ElectionPeer =
+                [_]ElectionPeer{.{}} ** options.max_members,
             promise_seen: [options.max_members]SlotSet =
                 [_]SlotSet{.{}} ** options.max_members,
+            /// First slot of the chunk the candidate is currently resolving.
+            recover_base: Slot = 0,
             recovered: [options.window_slots]RecoveredCell =
                 [_]RecoveredCell{.{}} ** options.window_slots,
             lead: [options.window_slots]LeadCell =
                 [_]LeadCell{.{}} ** options.window_slots,
 
-            /// The greatest slot whose cell the host has released for reuse.
-            /// Fixed at zero until eviction ships with the bounded phase one
-            /// (ZDS 0011); the occupancy check `next_slot - memory_floor`
-            /// already expresses window backpressure in terms of it.
+            /// The greatest slot whose cell the host has released for reuse:
+            /// everything at or below it is journal-durable and consumed by
+            /// the host, which is what licenses eviction (ZDS 0011).
             memory_floor: Slot = 0,
+
+            /// The chosen-trim anchor this acceptor answers Phase 1 with
+            /// for its released prefix. Installed by the host once trim
+            /// records are wired in; zero on a fresh or untrimmed node.
+            anchor: TrimAnchor = .{},
 
             /// Initializes a member with priority zero.
             pub fn init(self: *Node, id: NodeId, membership: *const Membership) !void {
@@ -715,10 +813,46 @@ pub fn ProtocolGated(
                 durable: *const DurableState,
                 leader_priority: u32,
             ) !void {
+                try self.restoreAt(id, membership, durable, 0, leader_priority);
+            }
+
+            /// Restores a member whose host has already consumed the prefix
+            /// through `floor`: the memory floor and delivered prefix resume
+            /// there, so a replayed window whose early cells were reused
+            /// stays deliverable. `decidedThrough()` reports `floor` until
+            /// commits above it re-release the suffix.
+            pub fn restoreAt(
+                self: *Node,
+                id: NodeId,
+                membership: *const Membership,
+                durable: *const DurableState,
+                floor: Slot,
+                leader_priority: u32,
+            ) !void {
                 try self.initWithPriority(id, membership, leader_priority);
                 self.durable = durable.*;
-                self.next_slot = self.highestUsedSlot() + 1;
+                self.memory_floor = floor;
+                self.delivered_through = floor;
+                self.next_slot = @max(self.highestUsedSlot(), floor) + 1;
                 self.assertValid();
+            }
+
+            /// Records that the host has durably consumed every released
+            /// entry through `through`, licensing cell reuse below it. The
+            /// claim is a host obligation in the same class as
+            /// `confirmWritesDurable`: the core can check only monotonicity
+            /// and that the slots were delivered.
+            pub fn advanceMemoryFloor(self: *Node, through: Slot) !void {
+                self.assertValid();
+                if (through > self.delivered_through) return error.InvalidSlot;
+                if (through > self.memory_floor) self.memory_floor = through;
+                self.assertValid();
+            }
+
+            /// Returns the memory floor: the greatest slot whose cell the
+            /// host has released for reuse.
+            pub fn memoryFloor(self: *const Node) Slot {
+                return self.memory_floor;
             }
 
             /// Restores a non-voting learner from its commit-only journal.
@@ -814,6 +948,12 @@ pub fn ProtocolGated(
                 if (self.role == .leader) {
                     self.sendHeartbeatIfDue(effects);
                     self.resendIfDue(effects);
+                } else if (self.role == .preparing and
+                    self.election_ticks < options.election_timeout_ticks)
+                {
+                    // Retry a chunk stalled on window backpressure; the
+                    // floor may have advanced since the last attempt.
+                    try self.maybeResolveChunk(effects);
                 } else if (self.campaign_enabled and
                     self.election_ticks >= options.election_timeout_ticks)
                 {
@@ -834,6 +974,7 @@ pub fn ProtocolGated(
                 } else if (self.leader_hint == peer) {
                     self.sendTo(peer, effects, .{ .learn = .{
                         .from_slot = self.delivered_through + 1,
+                        .count = @intCast(chunk_slots),
                     } });
                 }
                 self.assertValid();
@@ -853,7 +994,10 @@ pub fn ProtocolGated(
                 effects.addMessage(.{
                     .from = self.id,
                     .to = peer,
-                    .message = .{ .learn = .{ .from_slot = from_slot } },
+                    .message = .{ .learn = .{
+                        .from_slot = from_slot,
+                        .count = @intCast(chunk_slots),
+                    } },
                 });
                 self.assertValid();
             }
@@ -884,7 +1028,7 @@ pub fn ProtocolGated(
                     .prepare => |message| try self.onPrepare(
                         envelope.from,
                         message.ballot,
-                        message.decided_through,
+                        message.first,
                         effects,
                     ),
                     .promise => |message| try self.onPromise(
@@ -892,7 +1036,7 @@ pub fn ProtocolGated(
                         message,
                         effects,
                     ),
-                    .promise_done => |message| try self.onPromiseDone(
+                    .promise_range => |message| try self.onPromiseRange(
                         envelope.from,
                         message,
                         effects,
@@ -914,7 +1058,7 @@ pub fn ProtocolGated(
                     ),
                     .learn => |message| try self.onLearn(
                         envelope.from,
-                        message.from_slot,
+                        message,
                         effects,
                     ),
                     .nack => |message| self.onNack(envelope.from, message),
@@ -973,6 +1117,10 @@ pub fn ProtocolGated(
             ) ![]const Committed {
                 self.assertValid();
                 if (from_slot == 0) return error.InvalidSlot;
+                // History at or below the floor may occupy reused cells; the
+                // host recovers it from its own journal or materialized
+                // state, never from the window.
+                if (from_slot <= self.memory_floor) return error.Trimmed;
                 if (from_slot > self.delivered_through) return output[0..0];
 
                 const available = self.delivered_through - from_slot + 1;
@@ -1024,9 +1172,10 @@ pub fn ProtocolGated(
                 self.noop_set = true;
                 self.election_ticks = 0;
                 self.clearElection();
+                self.recover_base = self.delivered_through + 1;
                 self.broadcast(effects, .{ .prepare = .{
                     .ballot = self.ballot,
-                    .decided_through = self.delivered_through,
+                    .first = self.recover_base,
                 } });
             }
 
@@ -1041,20 +1190,23 @@ pub fn ProtocolGated(
             }
 
             /// Lamport step 2: promise a ballot not below the current one
-            /// and reply with LastVote information for every slot above
-            /// the proposer's decided prefix, including decrees learned
-            /// without voting (paper section 3.1) as zero-ballot votes.
+            /// and reply with LastVote information for the requested chunk,
+            /// including decrees learned without voting (paper section 3.1)
+            /// as zero-ballot votes. Slots at or below this acceptor's trim
+            /// anchor are answered by the anchor itself: their absence from
+            /// the window means chosen, never open (ZDS 0011).
             fn onPrepare(
                 self: *Node,
                 from: NodeId,
                 ballot: Ballot,
-                decided_through: Slot,
+                first: Slot,
                 effects: *Effects,
             ) !void {
                 if (ballot.lessThan(self.durable.promised)) {
                     self.sendNack(from, ballot, effects);
                     return;
                 }
+                if (first == 0) return error.InvalidSlot;
 
                 if (!ballot.eql(self.durable.promised)) {
                     self.durable.promised = ballot;
@@ -1063,16 +1215,23 @@ pub fn ProtocolGated(
                 self.observeLeader(from, ballot);
                 if (self.ballot.lessThan(ballot)) self.role = .follower;
 
-                var accepted_count: Slot = 0;
+                const limit = first +| (chunk_slots - 1);
+                var accepted_count: u32 = 0;
+                var more = false;
                 for (&self.durable.cells) |*cell| {
-                    if (cell.slot == 0 or cell.slot <= decided_through) continue;
-                    // Report this slot's vote. A decree that was learned
-                    // without voting still travels as a zero-ballot vote:
-                    // the paper's parliamentary protocol has legislators
-                    // return already-passed decrees with their LastVote
-                    // reply so a president behind on the log recovers them.
-                    // A zero ballot loses to every real vote, so it can
-                    // never override the choosing quorum's value.
+                    if (cell.slot < first or cell.slot == 0) continue;
+                    if (cell.slot <= self.anchor.chosen_trim_slot) continue;
+                    if (cell.slot > limit) {
+                        more = true;
+                        continue;
+                    }
+                    // A decree that was learned without voting still travels
+                    // as a zero-ballot vote: the paper's parliamentary
+                    // protocol has legislators return already-passed decrees
+                    // with their LastVote reply so a president behind on the
+                    // log recovers them. A zero ballot loses to every real
+                    // vote, so it can never override the choosing quorum's
+                    // value.
                     var known = cell.accepted;
                     if (known == null) {
                         if (cell.committed) |value| {
@@ -1095,16 +1254,23 @@ pub fn ProtocolGated(
                 effects.addMessage(.{
                     .from = self.id,
                     .to = from,
-                    .message = .{ .promise_done = .{
+                    .message = .{ .promise_range = .{
                         .ballot = ballot,
+                        .anchor = self.anchor,
+                        .chosen_through = self.delivered_through,
+                        .first = first,
+                        .last = limit,
                         .accepted_count = accepted_count,
-                        .decided_through = self.delivered_through,
+                        .more = more,
                     } },
                 });
             }
 
             /// Lamport step 3 (collection): keep the highest-ballot vote
             /// per slot across the promise quorum, as condition B3 needs.
+            /// Only votes for the active chunk are counted; anything else
+            /// is a stale duplicate from an already-resolved chunk, and
+            /// dropping it keeps every counted slot in a distinct cell.
             fn onPromise(
                 self: *Node,
                 from: NodeId,
@@ -1113,21 +1279,19 @@ pub fn ProtocolGated(
             ) !void {
                 if (self.role != .preparing) return;
                 if (!message.ballot.eql(self.ballot)) return;
-                if (message.slot == 0) return;
+                if (message.slot < self.recover_base) return;
+                if (message.slot > self.chunkLimit()) return;
 
                 const member = self.membership.indexOf(from) orelse return;
                 const index = cellIndex(message.slot);
                 if (self.promise_seen[member].insert(index)) {
-                    self.promise_received[member] += 1;
+                    self.election[member].received_in_range += 1;
                 }
 
                 const cell = &self.recovered[index];
-                // Every promise reports live cells only, so within one
-                // election all reported slots occupy distinct physical
-                // indexes; a cross-slot collision would need per-member
-                // window skew, which requires the memory floor to move.
-                std.debug.assert(cell.slot == 0 or cell.slot == message.slot);
                 if (cell.slot != message.slot) {
+                    // The old occupant belongs to a resolved chunk.
+                    std.debug.assert(cell.slot < self.recover_base);
                     cell.* = .{ .slot = message.slot };
                 }
                 if (cell.accepted) |recovered| {
@@ -1137,63 +1301,191 @@ pub fn ProtocolGated(
                 } else {
                     cell.accepted = message.accepted;
                 }
-                try self.maybeBecomeLeader(effects);
+                try self.maybeResolveChunk(effects);
             }
 
-            fn onPromiseDone(
+            fn onPromiseRange(
                 self: *Node,
                 from: NodeId,
-                message: PromiseDone,
+                message: PromiseRange,
                 effects: *Effects,
             ) !void {
                 if (self.role != .preparing) return;
                 if (!message.ballot.eql(self.ballot)) return;
-                if (message.accepted_count > options.window_slots) return error.InvalidPromise;
+                if (message.accepted_count > chunk_slots) {
+                    return error.InvalidPromise;
+                }
+                if (message.last < message.first) return error.InvalidPromise;
 
                 const member = self.membership.indexOf(from) orelse return;
-                self.promise_done[member] = true;
-                self.promise_expected[member] = message.accepted_count;
-                try self.maybeBecomeLeader(effects);
+                const peer = &self.election[member];
+                // Anchors and chosen prefixes are true facts whenever they
+                // arrive; the fences only grow.
+                if (message.anchor.chosen_trim_slot > peer.anchor.chosen_trim_slot) {
+                    peer.anchor = message.anchor;
+                }
+                peer.chosen_through = @max(peer.chosen_through, message.chosen_through);
+                if (message.first != self.recover_base) return;
+
+                peer.range_first = message.first;
+                peer.range_last = message.last;
+                peer.expected_in_range = message.accepted_count;
+                peer.range_described = true;
+                peer.more = message.more;
+                try self.maybeResolveChunk(effects);
             }
 
-            /// Lamport step 3 (proposal): with complete promises from a
-            /// read quorum, re-drive recovered values, fill gaps with the
-            /// no-op decree, and release this node's own decided prefix.
-            fn maybeBecomeLeader(self: *Node, effects: *Effects) !void {
+            /// Lamport step 3 (proposal), one chunk at a time: once a read
+            /// quorum has fully described the active chunk, drive it and
+            /// either continue with the next chunk or take leadership.
+            fn maybeResolveChunk(self: *Node, effects: *Effects) !void {
                 var complete: usize = 0;
+                var any_more = false;
                 for (0..self.membership.count) |member| {
-                    if (!self.promise_done[member]) continue;
-                    if (self.promise_received[member] == self.promise_expected[member]) {
+                    const peer = &self.election[member];
+                    if (!peer.range_described) continue;
+                    if (peer.received_in_range >= peer.expected_in_range) {
                         complete += 1;
+                        if (peer.more) any_more = true;
                     }
                 }
                 if (complete < self.membership.readQuorum()) return;
                 if (!self.noop_set) return error.MissingNoop;
 
-                self.role = .leader;
-                self.leader_hint = self.id;
+                const resolved = try self.resolveChunk(any_more, effects);
+                // A chunk clamped by the memory floor is window
+                // backpressure during the election: stay preparing and let
+                // the tick retry once the host releases cells.
+                if (!resolved) return;
+                if (any_more) {
+                    self.beginNextChunk(effects);
+                    return;
+                }
+                self.becomeLeader(effects);
+            }
 
-                const highest = self.highestRecoveredSlot();
-                var slot: Slot = self.memory_floor + 1;
-                while (slot <= highest) : (slot += 1) {
+            /// Drives every slot of the resolved chunk above the quorum
+            /// fences. F (the greatest trim anchor) and K (the greatest
+            /// chosen prefix) are both permanently chosen territory: a
+            /// slot at or below them is never filled or re-proposed,
+            /// because a vote's absence there means released, not open. A
+            /// zero-ballot vote is a learned decree and re-broadcasts as a
+            /// commit; values chosen elsewhere but absent here arrive by
+            /// catch-up before new proposals, which start above both
+            /// fences.
+            fn resolveChunk(self: *Node, any_more: bool, effects: *Effects) !bool {
+                const fences = self.quorumFences();
+                const fence = @max(fences.trim, fences.chosen);
+                var slot = @max(self.recover_base, fence + 1);
+                // A hole is filled with the no-op only below known state:
+                // slots past everything the quorum knows are unallocated,
+                // not gaps. When a member reports more beyond this chunk,
+                // the whole chunk is below known state.
+                const known_high = @max(
+                    @max(self.highestUsedSlot(), self.highestRecoveredSlot()),
+                    fence,
+                );
+                const limit = if (any_more)
+                    self.chunkLimit()
+                else
+                    @min(self.chunkLimit(), known_high);
+                // Driving a slot needs its physical cell; occupants above
+                // the memory floor are not evictable yet, so the drive
+                // range is clamped and the caller stays preparing.
+                const drive_limit =
+                    @min(limit, self.memory_floor +| options.window_slots);
+                while (slot <= drive_limit) : (slot += 1) {
                     if (self.durable.committedAt(slot)) |value| {
                         self.broadcastPeers(effects, .{ .commit = .{
                             .slot = slot,
                             .value = value,
                         } });
+                        continue;
+                    }
+                    if (self.recoveredAt(slot)) |vote| {
+                        if (vote.ballot.round == 0) {
+                            try self.recordCommit(slot, vote.value, effects);
+                            self.broadcastPeers(effects, .{ .commit = .{
+                                .slot = slot,
+                                .value = vote.value,
+                            } });
+                        } else {
+                            try self.sendAccept(slot, vote.value, effects);
+                        }
                     } else {
-                        const value = if (self.recoveredAt(slot)) |accepted|
-                            accepted.value
-                        else
-                            self.noop;
-                        try self.sendAccept(slot, value, effects);
+                        try self.sendAccept(slot, self.noop, effects);
                     }
                 }
+                if (fences.chosen > self.delivered_through) {
+                    if (fences.chosen_peer) |peer| {
+                        self.sendTo(peer, effects, .{ .learn = .{
+                            .from_slot = self.delivered_through + 1,
+                            .count = @intCast(chunk_slots),
+                        } });
+                    }
+                }
+                return drive_limit >= limit;
+            }
+
+            fn beginNextChunk(self: *Node, effects: *Effects) void {
+                self.recover_base = self.chunkLimit() + 1;
+                for (0..self.membership.count) |member| {
+                    const peer = &self.election[member];
+                    peer.range_first = 0;
+                    peer.range_last = 0;
+                    peer.expected_in_range = 0;
+                    peer.received_in_range = 0;
+                    peer.range_described = false;
+                    peer.more = false;
+                }
+                self.promise_seen = [_]SlotSet{.{}} ** options.max_members;
+                self.broadcast(effects, .{ .prepare = .{
+                    .ballot = self.ballot,
+                    .first = self.recover_base,
+                } });
+            }
+
+            fn becomeLeader(self: *Node, effects: *Effects) void {
+                self.role = .leader;
+                self.leader_hint = self.id;
+                const fences = self.quorumFences();
+                const highest = @max(
+                    self.highestUsedSlot(),
+                    @max(fences.trim, fences.chosen),
+                );
                 self.next_slot = @max(self.next_slot, highest + 1);
                 // A leader restored from its journal re-releases its own
-                // contiguous committed prefix; peers hear the re-broadcast
-                // commits above, but nobody sends commits to the leader.
+                // contiguous committed prefix; peers hear re-broadcast
+                // commits during resolution, but nobody sends commits to
+                // the leader.
                 self.emitContiguous(effects);
+            }
+
+            const Fences = struct {
+                trim: Slot,
+                chosen: Slot,
+                chosen_peer: ?NodeId,
+            };
+
+            fn quorumFences(self: *const Node) Fences {
+                var fences = Fences{
+                    .trim = self.anchor.chosen_trim_slot,
+                    .chosen = self.delivered_through,
+                    .chosen_peer = null,
+                };
+                for (0..self.membership.count) |member| {
+                    const peer = &self.election[member];
+                    fences.trim = @max(fences.trim, peer.anchor.chosen_trim_slot);
+                    if (peer.chosen_through > fences.chosen) {
+                        fences.chosen = peer.chosen_through;
+                        fences.chosen_peer = self.membership.ids[member];
+                    }
+                }
+                return fences;
+            }
+
+            fn chunkLimit(self: *const Node) Slot {
+                return self.recover_base +| (chunk_slots - 1);
             }
 
             /// Lamport step 4: vote unless the ballot is below the promise;
@@ -1213,7 +1505,7 @@ pub fn ProtocolGated(
                 // A slot whose physical cell still holds another live slot
                 // cannot vote yet; the request is dropped and the leader's
                 // resend recovers it after this node's window advances.
-                const cell = self.durable.claim(message.slot) orelse return;
+                const cell = self.claimLive(message.slot) orelse return;
 
                 if (cell.accepted) |accepted| {
                     if (accepted.ballot.eql(message.ballot)) {
@@ -1315,6 +1607,7 @@ pub fn ProtocolGated(
                 if (message.decided_through > self.delivered_through) {
                     self.sendTo(from, effects, .{ .learn = .{
                         .from_slot = self.delivered_through + 1,
+                        .count = @intCast(chunk_slots),
                     } });
                 }
             }
@@ -1325,10 +1618,22 @@ pub fn ProtocolGated(
                 // slot whose cell was already released: it was chosen and
                 // delivered, so there is nothing left to record.
                 if (slot <= self.memory_floor) return;
-                // A commit whose physical cell still holds an earlier live
-                // slot is dropped; delivery cannot pass the earlier slot
-                // anyway, and the commit is re-sent once the window advances.
-                const cell = self.durable.claim(slot) orelse return;
+                // A commit whose physical cell is owned by another live
+                // slot does not need window residency: at exactly the next
+                // delivery position it passes straight through to the host,
+                // and anywhere else it is dropped and re-served later.
+                const cell = self.claimLive(slot) orelse {
+                    if (slot == self.delivered_through + 1) {
+                        effects.addWrite(.{ .commit = .{
+                            .slot = slot,
+                            .value = value,
+                        } });
+                        effects.addCommitted(.{ .slot = slot, .value = value });
+                        self.delivered_through = slot;
+                        self.emitContiguous(effects);
+                    }
+                    return;
+                };
                 if (cell.committed) |committed| {
                     if (!std.meta.eql(committed, value)) return error.ConflictingCommit;
                     // A duplicate commit still releases the contiguous
@@ -1363,12 +1668,29 @@ pub fn ProtocolGated(
             fn onLearn(
                 self: *Node,
                 from: NodeId,
-                from_slot: Slot,
+                message: Learn,
                 effects: *Effects,
             ) !void {
-                if (from_slot == 0) return error.InvalidSlot;
+                if (message.from_slot == 0) return error.InvalidSlot;
+                if (message.count == 0 or
+                    message.count > chunk_slots)
+                {
+                    return error.InvalidSlot;
+                }
+                const limit = message.from_slot +| (message.count - 1);
+                if (message.from_slot <= self.memory_floor) {
+                    // The requested prefix left the window; the host owns
+                    // that history and serves it as commit envelopes.
+                    const served_through = @min(limit, self.memory_floor);
+                    effects.addRequest(.{ .serve_range = .{
+                        .peer = from,
+                        .first = message.from_slot,
+                        .count = @intCast(served_through - message.from_slot + 1),
+                    } });
+                }
                 for (&self.durable.cells) |*cell| {
-                    if (cell.slot == 0 or cell.slot < from_slot) continue;
+                    if (cell.slot < message.from_slot or cell.slot == 0) continue;
+                    if (cell.slot > limit) continue;
                     if (cell.committed) |value| {
                         effects.addMessage(.{
                             .from = self.id,
@@ -1417,7 +1739,7 @@ pub fn ProtocolGated(
                 // The occupancy check in `propose` and the recovery bound in
                 // `maybeBecomeLeader` keep every driven slot inside the
                 // window, so the leader's own claim cannot fail.
-                const cell = self.durable.claim(slot) orelse return error.WindowOverrun;
+                const cell = self.claimLive(slot) orelse return error.WindowOverrun;
                 cell.accepted = .{
                     .ballot = self.ballot,
                     .value = value,
@@ -1507,6 +1829,20 @@ pub fn ProtocolGated(
                 return if (cell.slot == slot) cell.accepted else null;
             }
 
+            /// Claims the physical cell for `slot` on the live path. On top
+            /// of the replay rule, the occupant must sit at or below the
+            /// memory floor: the host has consumed it, so reuse cannot lose
+            /// anything the window still owes anyone (ZDS 0011 eviction).
+            fn claimLive(self: *Node, slot: Slot) ?*DurableCell {
+                const cell = &self.durable.cells[cellIndex(slot)];
+                if (cell.slot != slot and cell.slot != 0 and
+                    cell.slot > self.memory_floor)
+                {
+                    return null;
+                }
+                return self.durable.claim(slot);
+            }
+
             fn sendTo(
                 self: *Node,
                 peer: NodeId,
@@ -1534,10 +1870,9 @@ pub fn ProtocolGated(
             }
 
             fn clearElection(self: *Node) void {
-                self.promise_done = [_]bool{false} ** options.max_members;
-                self.promise_expected = [_]Slot{0} ** options.max_members;
-                self.promise_received = [_]Slot{0} ** options.max_members;
+                self.election = [_]ElectionPeer{.{}} ** options.max_members;
                 self.promise_seen = [_]SlotSet{.{}} ** options.max_members;
+                self.recover_base = 0;
                 self.recovered = [_]RecoveredCell{.{}} ** options.window_slots;
                 self.lead = [_]LeadCell{.{}} ** options.window_slots;
             }
@@ -1572,8 +1907,8 @@ pub fn ProtocolGated(
 
         fn extractDecidedThrough(message: Message) ?Slot {
             switch (message) {
-                .prepare => |m| return m.decided_through,
-                .promise_done => |m| return m.decided_through,
+                .prepare => |m| return if (m.first > 0) m.first - 1 else 0,
+                .promise_range => |m| return m.chosen_through,
                 .accepted => |m| return m.decided_through,
                 .nack => |m| return m.decided_through,
                 .heartbeat => |m| return m.decided_through,
@@ -1626,7 +1961,7 @@ test "acceptor-only member never campaigns but still promises" {
         .to = 2,
         .message = .{ .prepare = .{
             .ballot = .{ .round = 1, .node = 1 },
-            .decided_through = 0,
+            .first = 1,
         } },
     }, &effects);
     try std.testing.expect(effects.writesSlice().len > 0);
@@ -1777,7 +2112,7 @@ test "duplicate messages are idempotent" {
         .to = 2,
         .message = .{ .prepare = .{
             .ballot = .{ .round = 1, .node = 1 },
-            .decided_through = 0,
+            .first = 1,
         } },
     };
     try node.step(prepare, &effects);
@@ -1839,7 +2174,7 @@ test "phase one tolerates reordering and recovers the highest accepted value" {
         // Deliver each completion marker before its entry to exercise a network
         // that does not preserve sender ordering.
         for (effects.messagesSlice()) |reply| {
-            if (reply.message == .promise_done) {
+            if (reply.message == .promise_range) {
                 replies[reply_count] = reply;
                 reply_count += 1;
             }
@@ -1869,6 +2204,106 @@ test "phase one tolerates reordering and recovers the highest accepted value" {
     }
     try std.testing.expectEqual(TestProtocol.Role.leader, nodes[2].role);
     try std.testing.expect(saw_recovered_accept);
+}
+
+test "the window continues past its size once the floor advances" {
+    const P = Protocol(u64, .{ .max_members = 1, .window_slots = 4 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{1});
+    var node: P.Node = undefined;
+    try node.init(1, &membership);
+    node.role = .leader;
+    node.ballot = .{ .round = 1, .node = 1 };
+    var effects = P.Effects{};
+
+    // Three full windows of slots commit through the same four cells.
+    var slot: Slot = 1;
+    while (slot <= 12) : (slot += 1) {
+        try std.testing.expectEqual(slot, try node.propose(slot * 100, &effects));
+        effects.confirmWritesDurable();
+        try std.testing.expectEqual(slot, node.decidedThrough());
+        try node.advanceMemoryFloor(slot);
+    }
+    try std.testing.expectEqual(@as(Slot, 12), node.decidedThrough());
+
+    // Released history answers from the host, not the window.
+    try std.testing.expectEqual(@as(?u64, null), node.committedAt(3));
+    var output: [4]P.Committed = undefined;
+    try std.testing.expectError(error.Trimmed, node.readDecided(2, &output));
+
+    // A stalled floor turns into transient backpressure once the window
+    // fills, then clears when the host releases cells.
+    while (slot <= 16) : (slot += 1) {
+        try std.testing.expectEqual(slot, try node.propose(slot * 100, &effects));
+        effects.confirmWritesDurable();
+    }
+    try std.testing.expectError(error.WindowFull, node.propose(1700, &effects));
+    try node.advanceMemoryFloor(16);
+    try std.testing.expectEqual(@as(Slot, 17), try node.propose(1700, &effects));
+    effects.confirmWritesDurable();
+}
+
+test "an election spanning several chunks recovers the whole history" {
+    const P = Protocol(u64, .{
+        .max_members = 3,
+        .window_slots = 16,
+        .recovery_chunk_slots = 4,
+    });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+
+    // One survivor holds ten committed slots; a fresh peer campaigns and
+    // must fetch that history four slots at a time before leading.
+    var survivor: P.Node = undefined;
+    try survivor.init(2, &membership);
+    var fresh: P.Node = undefined;
+    try fresh.init(1, &membership);
+    var effects = P.Effects{};
+
+    var slot: Slot = 1;
+    while (slot <= 10) : (slot += 1) {
+        try survivor.step(.{ .from = 3, .to = 2, .message = .{ .commit = .{
+            .slot = slot,
+            .value = slot * 10,
+        } } }, &effects);
+        effects.confirmWritesDurable();
+    }
+    try std.testing.expectEqual(@as(Slot, 10), survivor.decidedThrough());
+
+    var queue: [256]P.Envelope = undefined;
+    var queue_count: usize = 0;
+    try fresh.campaign(0, &effects);
+    effects.confirmWritesDurable();
+    for (effects.messagesSlice()) |message| {
+        queue[queue_count] = message;
+        queue_count += 1;
+    }
+
+    var guard: usize = 0;
+    while (queue_count > 0) : (guard += 1) {
+        try std.testing.expect(guard < 1024);
+        const envelope = queue[0];
+        std.mem.copyForwards(
+            P.Envelope,
+            queue[0 .. queue_count - 1],
+            queue[1..queue_count],
+        );
+        queue_count -= 1;
+        // The third member stays silent; the two-node quorum suffices.
+        if (envelope.to == 3) continue;
+        const target: *P.Node = if (envelope.to == 1) &fresh else &survivor;
+        try target.step(envelope, &effects);
+        effects.confirmWritesDurable();
+        for (effects.messagesSlice()) |message| {
+            queue[queue_count] = message;
+            queue_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(P.Role.leader, fresh.role);
+    try std.testing.expectEqual(@as(Slot, 10), fresh.decidedThrough());
+    try std.testing.expectEqual(@as(Slot, 11), fresh.next_slot);
+    try std.testing.expectEqual(@as(?u64, 50), fresh.committedAt(5));
 }
 
 test "a full window reports transient backpressure without reusing a cell" {
@@ -2049,7 +2484,7 @@ test "effects track durability confirmation for each write batch" {
         .to = 2,
         .message = .{ .prepare = .{
             .ballot = .{ .round = 1, .node = 1 },
-            .decided_through = 0,
+            .first = 1,
         } },
     }, &effects);
     try std.testing.expect(effects.writes_count > 0);
@@ -2096,7 +2531,7 @@ test "only accept requests are available before durability confirmation" {
         .to = 2,
         .message = .{ .prepare = .{
             .ballot = .{ .round = 2, .node = 1 },
-            .decided_through = 0,
+            .first = 1,
         } },
     }, &effects);
     var promises = effects.preDurableMessages();
@@ -2134,7 +2569,7 @@ test "catch-up returns known commits from the requested slot" {
     try node.step(.{
         .from = 2,
         .to = 1,
-        .message = .{ .learn = .{ .from_slot = 2 } },
+        .message = .{ .learn = .{ .from_slot = 2, .count = 16 } },
     }, &effects);
     try std.testing.expectEqual(@as(usize, 2), effects.messages_count);
     for (effects.messagesSlice()) |message| {

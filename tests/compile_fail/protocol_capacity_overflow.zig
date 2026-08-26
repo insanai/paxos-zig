@@ -7,5 +7,6 @@ comptime {
     _ = paxos.Protocol(u64, .{
         .max_members = 65535,
         .window_slots = 1 << 31,
+        .recovery_chunk_slots = 1 << 31,
     });
 }

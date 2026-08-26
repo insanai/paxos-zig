@@ -17,6 +17,8 @@ pub const Options = struct {
     max_members: usize = 7,
     /// Power-of-two consensus window forwarded to the core (ZDS 0011).
     window_slots: usize = 256,
+    /// Recovery chunk forwarded to the core; null derives min(64, window).
+    recovery_chunk_slots: ?usize = null,
     max_batch: usize = 64,
     max_metadata_bytes: usize = 256,
     read_quorum_size: ?u16 = null,
@@ -108,6 +110,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
     const Core = protocol.Protocol(EntryType, .{
         .max_members = options.max_members,
         .window_slots = options.window_slots,
+        .recovery_chunk_slots = options.recovery_chunk_slots,
         .read_quorum_size = options.read_quorum_size,
         .write_quorum_size = options.write_quorum_size,
         .election_timeout_ticks = options.election_timeout_ticks,
@@ -382,6 +385,17 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             /// Returns the contiguous decided prefix in this configuration.
             pub fn decidedThrough(self: *const Node) protocol.Slot {
                 return self.core.decidedThrough();
+            }
+
+            /// Records that the host durably consumed every released entry
+            /// through `through`, licensing consensus-cell reuse below it.
+            pub fn advanceMemoryFloor(self: *Node, through: protocol.Slot) !void {
+                try self.core.advanceMemoryFloor(through);
+            }
+
+            /// Returns the memory floor the host has released.
+            pub fn memoryFloor(self: *const Node) protocol.Slot {
+                return self.core.memoryFloor();
             }
 
             /// Returns the latest observed leader.

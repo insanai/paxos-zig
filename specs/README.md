@@ -128,3 +128,87 @@ violation, in about one second.
 The invariants are not vacuous: deliberately removing the
 CURRENT-before-REGISTRY guard from `FlipPointer` makes TLC report a
 `PointerNeverDangles` violation immediately.
+
+## GlobalTrim.tla
+
+`GlobalTrim.tla` is the model for ZDS 0011: global 64-bit slots, the
+tagged consensus window, certified log trimming, and the host frontiers
+around them. It re-models Paxos shallowly (like `VoterReplacement.tla`
+it does not re-prove the deep consensus results that are `Paxos.tla`'s
+job) because six of its invariants need ballots, and it models the
+window physically: each voter has `W` cells addressed by `slot % W`
+with an explicit tag, so cell reuse and its guards are checked as
+implemented rather than assumed away.
+
+The voter set is fixed. The lease-protected `Joiner` models the
+state-transfer half of a membership change: install at a leased base,
+replay the suffix from any surviving node, and count toward the trim
+minimum only after its first durable anchor. The activation discipline
+of a voter-set change itself remains `VoterReplacement.tla`'s job, and
+slot continuity across a stop sign is checked by
+`sim/reconfiguration.zig`'s oracles.
+
+## Action-to-code mapping
+
+| Spec action           | Code                                                |
+| --------------------- | --------------------------------------------------- |
+| `Prepare` / `Promise` | `startCampaign` / `onPrepare` (PromiseV2: votes     |
+|                       | above the anchor plus the `chosen_through` summary) |
+| `Accept`              | leader range resolution: F = max quorum anchor,     |
+|                       | K = max quorum `chosen_through`; never propose at   |
+|                       | or below either fence                               |
+| `Vote` / `Learn`      | `onAccept` / `recordCommit` tagged-cell install     |
+|                       | under the eviction guard (`CanInstall`)             |
+| `Decide`              | `onAccepted` write-quorum choice                    |
+| `AdvanceChosen`       | `emitContiguous` / `decidedThrough`                 |
+| `AdvanceFloor`        | `advanceMemoryFloor`                                |
+| `ExecuteNext`         | `applyBatchOffline` and anchor-suffix replay        |
+| `AnchorState`         | `applied_anchor.publish`                            |
+| `CrashImage`          | power loss before the next APPLIED barrier          |
+| `ChooseTrim`          | the chosen `Command.trim` entry (`G = min A_i`      |
+|                       | over counted data replicas, `trim.candidate`)       |
+| `InstallTrim`         | `installChosenTrim` plus the durable TRIM record    |
+| `LocalDelete`         | segment unlink under `trim.deleteFloor`             |
+| `CreateLease` /       | transfer-lease lifecycle: chosen lease entry,       |
+| `InstallJoiner` /     | pinned image install at the base slot, completion   |
+| `CompleteLease`       | only after the receiver's anchor reaches `G`        |
+
+Checked invariants: `Agreement` and `ChosenPrefix` (no commit ever
+contradicts the first decision; claimed prefixes are chosen),
+`TagNonAliasing` (a tagged cell only sits in its own physical index),
+`TrimNeverExceedsCertifiedAnchor`, `AppliedNeverExceedsDurablePages`,
+`AcceptedOnlySlotNeverEvicted` (eviction never erases an open phase-two
+obligation), `PromiseRangeStartsAboveAnchor`,
+`LeaderNeverProposesAtOrBelowAnchor` (every accept is stamped with the
+fence its quorum reported and stays strictly above it),
+`LocalDeleteNeverExceedsDurableState`, `TransferLeasePreservesSuffix`,
+`RecoveryReadyImpliesExactPrefix`, `NoWitnessClaimsMaterializedState`,
+`FrontierOrder` (the ZDS 0011 frontier chain), and
+`PromisedDominatesVotes`. The `Monotone` action property is
+`GlobalSlotNeverDecreases`: decisions are immutable and every durable
+frontier is monotone, with the materialized image exempt because rolling
+back to the anchor at a crash is exactly what the anchor makes safe.
+
+Run the two checked-in configurations with:
+
+```sh
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 4 \
+    -config GlobalTrim.cfg GlobalTrim.tla
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -deadlock -workers 4 \
+    -config GlobalTrim5.cfg GlobalTrim.tla
+```
+
+`MaxMessages` bounds the monotonic message set; sixteen covers a full
+ballot over several slots, a competing ballot after a trim, and the
+catch-up traffic the window forces, and `MaxSlot = 3` with `W = 2`
+still forces physical cell reuse (slot 3 evicts slot 1). Deeper partial
+runs support the bounded result: `MaxSlot = 4` at bound eighteen
+explored 963 million states to depth 14, and at bound twenty-two 210
+million states to depth 13, with no violation before being stopped.
+
+The invariants are not vacuous: removing the eviction guard's
+chosen-and-below-floor condition makes TLC report
+`AcceptedOnlySlotNeverEvicted` in an eight-state trace, and removing
+the leader's K fence (proposing into a slot every quorum member had
+chosen and evicted) reports `LeaderNeverProposesAtOrBelowAnchor` in a
+twelve-state trace, both at `W = 1`, `MaxSlot = 2`.

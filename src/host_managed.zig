@@ -46,7 +46,7 @@ test "host-managed hosts may batch messages before confirming durability" {
         .to = 2,
         .message = .{ .prepare = .{
             .ballot = .{ .round = 1, .node = 1 },
-            .decided_through = 0,
+            .first = 1,
         } },
     }, &effects);
     try std.testing.expect(effects.writes_count > 0);
