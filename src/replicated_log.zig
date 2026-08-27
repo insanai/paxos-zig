@@ -471,7 +471,13 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                     const entry = cell.accepted orelse continue;
                     switch (entry.value) {
                         .command => {},
-                        .stop => |stop| return stop,
+                        // A stop naming a configuration this node already
+                        // runs is completed history, not a pending seal.
+                        .stop => |stop| if (stop.configuration_id >
+                            self.configuration_id)
+                        {
+                            return stop;
+                        },
                     }
                 }
                 for (&self.core.lead) |*cell| {
@@ -480,7 +486,11 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                     const entry = cell.proposal orelse continue;
                     switch (entry) {
                         .command => {},
-                        .stop => |stop| return stop,
+                        .stop => |stop| if (stop.configuration_id >
+                            self.configuration_id)
+                        {
+                            return stop;
+                        },
                     }
                 }
                 return null;
@@ -498,7 +508,9 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 for (effects.committedSlice()) |committed| {
                     switch (committed.value) {
                         .command => {},
-                        .stop => |stop| {
+                        .stop => |stop| if (stop.configuration_id >
+                            self.configuration_id)
+                        {
                             self.stop_sign = stop;
                             self.stop_slot = committed.slot;
                         },
@@ -512,7 +524,11 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                     const entry = cell.committed orelse continue;
                     switch (entry) {
                         .command => {},
-                        .stop => |stop| {
+                        // A replayed stop at or below the restored
+                        // configuration was already completed.
+                        .stop => |stop| if (stop.configuration_id >
+                            self.configuration_id)
+                        {
                             self.stop_sign = stop;
                             self.stop_slot = cell.slot;
                         },
