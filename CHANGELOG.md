@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-paxos-zig 0.3.0 and zaxonlite 0.4.0 (ZDS 0011). This is a breaking format
+paxos-zig 0.6.0 and zaxonlite 0.6.0 (ZDS 0011). This is a breaking format
 cut with no bridge: wire protocol 9, journal format 2, and the new durable
 state anchor replace their predecessors, and artifacts from earlier
 releases fail closed at open.
