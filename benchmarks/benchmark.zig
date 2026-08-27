@@ -135,13 +135,13 @@ fn MovingBench(
                 \\batch-average ns/value p50/p90/p99/max: {d}/{d}/{d}/{d}
                 \\
             , .{
-                workload,               batch,
-                paxos.version,          total,
-                node_count,             window_slots,
-                total / window_slots,   median,
-                moving_samples,         ns_per_value,
-                per_batch[0] / batch,   per_batch[1] / batch,
-                per_batch[2] / batch,   per_batch[3] / batch,
+                workload,             batch,
+                paxos.version,        total,
+                node_count,           window_slots,
+                total / window_slots, median,
+                moving_samples,       ns_per_value,
+                per_batch[0] / batch, per_batch[1] / batch,
+                per_batch[2] / batch, per_batch[3] / batch,
             });
             std.debug.print(
                 "{{\"impl\":\"paxos-zig\",\"workload\":\"{s}\"," ++
