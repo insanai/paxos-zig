@@ -468,12 +468,26 @@ fn findRun(runs: []const Run, workload: []const u8, mode: []const u8) ?*const Ru
     return null;
 }
 
-fn printGate(out: *Io.Writer, run_record: Run, gate: Gate, limit: f64) !void {
+fn printGate(out: *Io.Writer, run_record: Run, gate: Gate, limit: f64, enforced: bool) !void {
+    const status = if (!enforced)
+        "report-only"
+    else if (gate.pass)
+        "pass"
+    else
+        "FAIL";
+    const detail = if (enforced)
+        "raw samples"
+    else
+        "report-only: summary quantiles, not a sample";
+    const over_note = if (!enforced and !gate.pass)
+        " (bound over limit; not enforced)"
+    else
+        "";
     try out.print(
         "{s} {s}/{s}: shift {d:.2} ns/value, 95% ci [{d:.2}, {d:.2}], " ++
-            "baseline median {d:.2}, limit +{d:.0}% ({d:.2}) [{s}]\n",
+            "baseline median {d:.2}, limit +{d:.0}% ({d:.2}) [{s}]{s}\n",
         .{
-            if (gate.pass) "pass" else "FAIL",
+            status,
             run_record.workload,
             run_record.mode,
             gate.shift,
@@ -482,7 +496,8 @@ fn printGate(out: *Io.Writer, run_record: Run, gate: Gate, limit: f64) !void {
             gate.base_median,
             limit * 100,
             gate.limit_ns,
-            if (gate.paired) "paired quantiles" else "raw samples",
+            detail,
+            over_note,
         },
     );
 }
@@ -691,6 +706,29 @@ fn autocorrelation(series: []const f64, lag: usize) f64 {
 
 // --------------------------------------------------------------- tests
 
+fn testRun(source: SampleSource, samples: []f64) Run {
+    return .{
+        .workload = "u64-3n-moving",
+        .mode = "batch64",
+        .durable = false,
+        .source = source,
+        .samples = samples,
+        .series = null,
+        .values = 0,
+        .wraps = 0,
+    };
+}
+
+/// Runs the whole gate policy over in-memory Run records, discarding the
+/// report text and returning only the exit code.
+fn testGateAll(base_runs: []const Run, cand_runs: []const Run) !u8 {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [8192]u8 = undefined;
+    var writer = Io.Writer.fixed(&buffer);
+    return gateAll(arena.allocator(), base_runs, cand_runs, .{}, &writer);
+}
+
 test "identical raw distributions pass the gate" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -718,7 +756,7 @@ test "a ten percent raw shift fails the gate" {
     try std.testing.expect(!gate.pass);
 }
 
-test "paired quantile summaries gate identically and on shift" {
+test "paired quantile summaries are compared identically and on shift" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -735,6 +773,41 @@ test "paired quantile summaries gate identically and on shift" {
     const gate = try evaluate(alloc, &base, &shifted, true, in_memory_limit);
     try std.testing.expect(gate.shift > gate.limit_ns);
     try std.testing.expect(!gate.pass);
+}
+
+test "identical raw samples pass the whole gate" {
+    var base: [64]f64 = undefined;
+    for (&base, 0..) |*sample, index| {
+        sample.* = 100 + @as(f64, @floatFromInt((index * 7) % 13));
+    }
+    var same = base;
+    var base_runs = [_]Run{testRun(.raw, &base)};
+    var cand_runs = [_]Run{testRun(.raw, &same)};
+    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs));
+}
+
+test "a raw-sample regression fails the whole gate" {
+    var base: [64]f64 = undefined;
+    var cand: [64]f64 = undefined;
+    for (&base, &cand, 0..) |*baseline_sample, *candidate_sample, index| {
+        baseline_sample.* = 100 + @as(f64, @floatFromInt((index * 7) % 13));
+        candidate_sample.* = baseline_sample.* * 1.10;
+    }
+    var base_runs = [_]Run{testRun(.raw, &base)};
+    var cand_runs = [_]Run{testRun(.raw, &cand)};
+    try std.testing.expectEqual(exit_fail, try testGateAll(&base_runs, &cand_runs));
+}
+
+test "a quantile-only regression is report-only and never fails the gate" {
+    var base = [_]f64{ 130, 140, 160, 4040 };
+    var shifted: [4]f64 = undefined;
+    for (&shifted, base) |*candidate_sample, baseline_sample| {
+        candidate_sample.* = baseline_sample * 1.10;
+    }
+    try std.testing.expect(!enforcedSources(.batch_quantiles, .batch_quantiles));
+    var base_runs = [_]Run{testRun(.batch_quantiles, &base)};
+    var cand_runs = [_]Run{testRun(.batch_quantiles, &shifted)};
+    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs));
 }
 
 test "autocorrelation flags an injected periodic series" {
