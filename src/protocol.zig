@@ -400,6 +400,10 @@ pub fn ProtocolGated(
                 slot: Slot,
                 value: Value,
             },
+            /// A chosen trim anchor adopted by this node; replay restores
+            /// it so a trimmed acceptor answers Phase 1 correctly after a
+            /// restart (ZDS 0011).
+            trim_anchor: TrimAnchor,
         };
 
         /// One decided entry released to the application. Entries are always
@@ -477,7 +481,7 @@ pub fn ProtocolGated(
             pub fn requiresPowerLossBarrier(self: *const Effects) bool {
                 for (self.writesSlice()) |write| switch (write) {
                     .promise, .accept => return true,
-                    .commit => {},
+                    .commit, .trim_anchor => {},
                 };
                 return false;
             }
@@ -591,6 +595,7 @@ pub fn ProtocolGated(
         /// Durable acceptor and learner state reconstructed by journal replay.
         pub const DurableState = struct {
             promised: Ballot = Ballot.zero,
+            anchor: TrimAnchor = .{},
             cells: [options.window_slots]DurableCell =
                 [_]DurableCell{.{}} ** options.window_slots,
 
@@ -661,6 +666,14 @@ pub fn ProtocolGated(
                             .ballot = accepted.ballot,
                             .value = accepted.value,
                         };
+                    },
+                    .trim_anchor => |anchor| {
+                        if (anchor.trim_id < self.anchor.trim_id or
+                            anchor.chosen_trim_slot < self.anchor.chosen_trim_slot)
+                        {
+                            return error.TrimRegression;
+                        }
+                        self.anchor = anchor;
                     },
                     .commit => |committed| {
                         if (committed.slot == 0) return error.InvalidSlot;
@@ -738,11 +751,6 @@ pub fn ProtocolGated(
             /// everything at or below it is journal-durable and consumed by
             /// the host, which is what licenses eviction (ZDS 0011).
             memory_floor: Slot = 0,
-
-            /// The chosen-trim anchor this acceptor answers Phase 1 with
-            /// for its released prefix. Installed by the host once trim
-            /// records are wired in; zero on a fresh or untrimmed node.
-            anchor: TrimAnchor = .{},
 
             /// Initializes a member with priority zero.
             pub fn init(self: *Node, id: NodeId, membership: *const Membership) !void {
@@ -831,9 +839,12 @@ pub fn ProtocolGated(
             ) !void {
                 try self.initWithPriority(id, membership, leader_priority);
                 self.durable = durable.*;
-                self.memory_floor = floor;
-                self.delivered_through = floor;
-                self.next_slot = @max(self.highestUsedSlot(), floor) + 1;
+                // A replayed trim anchor implies the prefix through it is
+                // chosen and released; the floor never sits below it.
+                const base = @max(floor, self.durable.anchor.chosen_trim_slot);
+                self.memory_floor = base;
+                self.delivered_through = base;
+                self.next_slot = @max(self.highestUsedSlot(), base) + 1;
                 self.assertValid();
             }
 
@@ -853,6 +864,57 @@ pub fn ProtocolGated(
             /// host has released for reuse.
             pub fn memoryFloor(self: *const Node) Slot {
                 return self.memory_floor;
+            }
+
+            /// Adopts a chosen trim record: every slot at or below its
+            /// anchor is chosen under the bound history hash, and Phase 1
+            /// answers the prefix from the anchor instead of the window.
+            /// The host calls this when a trim entry commits; the emitted
+            /// write makes the adoption durable. Trimming never evicts by
+            /// itself; the memory floor still governs cell reuse.
+            pub fn installChosenTrim(
+                self: *Node,
+                anchor: TrimAnchor,
+                effects: *Effects,
+            ) !void {
+                self.assertValid();
+                if (anchor.chosen_trim_slot > self.delivered_through) {
+                    return error.InvalidSlot;
+                }
+                const current = &self.durable.anchor;
+                if (anchor.trim_id <= current.trim_id) return;
+                if (anchor.chosen_trim_slot < current.chosen_trim_slot) {
+                    return error.TrimRegression;
+                }
+                self.durable.anchor = anchor;
+                effects.addWrite(.{ .trim_anchor = anchor });
+                self.assertValid();
+            }
+
+            /// Returns the adopted chosen-trim anchor.
+            pub fn trimAnchor(self: *const Node) TrimAnchor {
+                return self.durable.anchor;
+            }
+
+            /// Resets this node onto an installed state image: the window
+            /// empties, and every frontier resumes at the anchor. The host
+            /// calls this after verifying a transferred image whose history
+            /// prefix ends exactly at the anchor, then replays the retained
+            /// suffix through ordinary steps.
+            pub fn beginRecovery(self: *Node, anchor: TrimAnchor) !void {
+                self.assertValid();
+                if (anchor.chosen_trim_slot < self.durable.anchor.chosen_trim_slot) {
+                    return error.TrimRegression;
+                }
+                self.durable.anchor = anchor;
+                self.durable.cells =
+                    [_]DurableCell{.{}} ** options.window_slots;
+                self.memory_floor = anchor.chosen_trim_slot;
+                self.delivered_through = anchor.chosen_trim_slot;
+                self.next_slot = anchor.chosen_trim_slot + 1;
+                self.role = .follower;
+                self.clearElection();
+                self.assertValid();
             }
 
             /// Restores a non-voting learner from its commit-only journal.
@@ -923,6 +985,7 @@ pub fn ProtocolGated(
                 }
 
                 const occupied: Slot = self.next_slot - 1 - self.memory_floor;
+                if (occupied >= options.window_slots) return error.WindowFull;
                 const free: Slot = @as(Slot, options.window_slots) - occupied;
                 if (values.len > free) return error.WindowFull;
 
@@ -1144,10 +1207,6 @@ pub fn ProtocolGated(
                 std.debug.assert(self.membership.count > 0);
                 std.debug.assert(self.membership.count <= options.max_members);
                 std.debug.assert(self.next_slot >= 1);
-                std.debug.assert(self.next_slot - 1 <=
-                    self.memory_floor + options.window_slots);
-                std.debug.assert(self.delivered_through <=
-                    self.memory_floor + options.window_slots);
 
                 self.durable.assertValid();
             }
@@ -1220,7 +1279,7 @@ pub fn ProtocolGated(
                 var more = false;
                 for (&self.durable.cells) |*cell| {
                     if (cell.slot < first or cell.slot == 0) continue;
-                    if (cell.slot <= self.anchor.chosen_trim_slot) continue;
+                    if (cell.slot <= self.durable.anchor.chosen_trim_slot) continue;
                     if (cell.slot > limit) {
                         more = true;
                         continue;
@@ -1256,7 +1315,7 @@ pub fn ProtocolGated(
                     .to = from,
                     .message = .{ .promise_range = .{
                         .ballot = ballot,
-                        .anchor = self.anchor,
+                        .anchor = self.durable.anchor,
                         .chosen_through = self.delivered_through,
                         .first = first,
                         .last = limit,
@@ -1469,7 +1528,7 @@ pub fn ProtocolGated(
 
             fn quorumFences(self: *const Node) Fences {
                 var fences = Fences{
-                    .trim = self.anchor.chosen_trim_slot,
+                    .trim = self.durable.anchor.chosen_trim_slot,
                     .chosen = self.delivered_through,
                     .chosen_peer = null,
                 };
@@ -2304,6 +2363,106 @@ test "an election spanning several chunks recovers the whole history" {
     try std.testing.expectEqual(@as(Slot, 10), fresh.decidedThrough());
     try std.testing.expectEqual(@as(Slot, 11), fresh.next_slot);
     try std.testing.expectEqual(@as(?u64, 50), fresh.committedAt(5));
+}
+
+test "a trimmed quorum closes its prefix to a new leader" {
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 4 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+
+    // Two acceptors chose and trimmed slots 1..6: their windows no longer
+    // hold that history, only the durable anchor.
+    var effects = P.Effects{};
+    var nodes: [2]P.Node = undefined;
+    for (&nodes, 0..) |*node, index| {
+        try node.init(@intCast(index + 2), &membership);
+        var slot: Slot = 1;
+        while (slot <= 6) : (slot += 1) {
+            try node.step(.{ .from = 1, .to = @intCast(index + 2), .message = .{
+                .commit = .{ .slot = slot, .value = slot * 10 },
+            } }, &effects);
+            effects.confirmWritesDurable();
+        }
+        try node.advanceMemoryFloor(6);
+        try node.installChosenTrim(.{
+            .trim_id = 1,
+            .chosen_trim_slot = 6,
+            .history_hash = [_]u8{7} ** 32,
+        }, &effects);
+        effects.confirmWritesDurable();
+    }
+
+    // A fresh candidate campaigns against the trimmed pair.
+    var fresh: P.Node = undefined;
+    try fresh.init(1, &membership);
+    try fresh.campaign(0, &effects);
+    effects.confirmWritesDurable();
+    var prepare_message: ?P.Envelope = null;
+    for (effects.messagesSlice()) |envelope| {
+        if (envelope.to != 1 and envelope.message == .prepare) {
+            prepare_message = envelope;
+        }
+    }
+
+    var scratch = P.Effects{};
+    for (&nodes, 0..) |*node, index| {
+        var prepare = prepare_message.?;
+        prepare.to = @intCast(index + 2);
+        try node.step(prepare, &scratch);
+        scratch.confirmWritesDurable();
+        for (scratch.messagesSlice()) |reply| {
+            try fresh.step(reply, &effects);
+            effects.confirmWritesDurable();
+        }
+    }
+
+    // Leadership is reached with the prefix closed: nothing was proposed
+    // at or below the anchor, and the first fresh proposal lands above it.
+    try std.testing.expectEqual(P.Role.leader, fresh.role);
+    for (effects.messagesSlice()) |envelope| {
+        if (envelope.message == .accept) {
+            try std.testing.expect(envelope.message.accept.slot > 6);
+        }
+    }
+    try std.testing.expectEqual(@as(Slot, 7), fresh.next_slot);
+}
+
+test "a trimmed quorum closes its prefix to a new leader after replay" {
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 4 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+
+    // The anchor survives a journal replay and restore.
+    var effects = P.Effects{};
+    var disk = P.DurableState{};
+    try disk.apply(.{ .trim_anchor = .{
+        .trim_id = 1,
+        .chosen_trim_slot = 6,
+        .history_hash = [_]u8{7} ** 32,
+    } });
+    var restored: P.Node = undefined;
+    try restored.restoreAt(2, &membership, &disk, 0, 0);
+    try std.testing.expectEqual(@as(Slot, 6), restored.trimAnchor().chosen_trim_slot);
+    try std.testing.expectEqual(@as(Slot, 6), restored.decidedThrough());
+
+    // Its Phase-1 answer carries the anchor rather than votes.
+    try restored.step(.{ .from = 1, .to = 2, .message = .{ .prepare = .{
+        .ballot = .{ .round = 1, .node = 1 },
+        .first = 1,
+    } } }, &effects);
+    effects.confirmWritesDurable();
+    var described = false;
+    for (effects.messagesSlice()) |envelope| {
+        switch (envelope.message) {
+            .promise => unreachable,
+            .promise_range => |range| {
+                try std.testing.expectEqual(@as(Slot, 6), range.anchor.chosen_trim_slot);
+                described = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(described);
 }
 
 test "a full window reports transient backpressure without reusing a cell" {

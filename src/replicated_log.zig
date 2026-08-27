@@ -139,6 +139,8 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
         pub const Committed = Core.Committed;
         /// Proposer status of the underlying core node.
         pub const Role = Core.Role;
+        /// The chosen-trim anchor exchanged with the host (ZDS 0011).
+        pub const TrimAnchor = Core.TrimAnchor;
 
         pub const Node = struct {
             core: Core.Node,
@@ -396,6 +398,30 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
             /// Returns the memory floor the host has released.
             pub fn memoryFloor(self: *const Node) protocol.Slot {
                 return self.core.memoryFloor();
+            }
+
+            /// Adopts a chosen trim record; see the core's
+            /// `installChosenTrim` for the contract.
+            pub fn installChosenTrim(
+                self: *Node,
+                anchor: Core.TrimAnchor,
+                effects: *Effects,
+            ) !void {
+                try self.core.installChosenTrim(anchor, effects);
+            }
+
+            /// Returns the adopted chosen-trim anchor.
+            pub fn trimAnchor(self: *const Node) Core.TrimAnchor {
+                return self.core.trimAnchor();
+            }
+
+            /// Resets onto an installed state image at `anchor`; the host
+            /// replays the retained suffix afterward.
+            pub fn beginRecovery(self: *Node, anchor: Core.TrimAnchor) !void {
+                try self.core.beginRecovery(anchor);
+                self.stop_sign = null;
+                self.stop_slot = 0;
+                self.recalculateStopPending();
             }
 
             /// Returns the latest observed leader.

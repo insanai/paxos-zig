@@ -43,6 +43,7 @@ pub fn explainError(err: anyerror) []const u8 {
         error.ConflictingValue,
         error.ConflictingCommit,
         error.ConflictingChosenValue,
+        error.TrimRegression,
         => explainSafetyError(err),
 
         error.InvalidConfigurationId,
@@ -281,6 +282,12 @@ fn explainSafetyError(err: anyerror) []const u8 {
         \\
         \\A learner saw two different chosen values for one slot.
         \\Hint: Treat this as a safety incident; stop and retain all evidence.
+        ,
+        error.TrimRegression =>
+        \\-- TRIM REGRESSION --------------------------------------------------------------
+        \\
+        \\A trim anchor moved backward or conflicts with the adopted one.
+        \\Hint: Stop the node and inspect trim records and journal ordering.
         ,
         else => unreachable,
     };
