@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     addSimulation(b, target, optimize, paxos, test_step);
     addApiDocs(b, paxos);
     addBenchmarks(b, target);
+    addBenchGate(b, test_step);
     addFormatting(b);
     addBook(b);
     addZds(b);
@@ -579,6 +580,33 @@ fn addBenchmarks(b: *std.Build, target: std.Build.ResolvedTarget) void {
     );
     benchmark_step.dependOn(&aggregate_libpaxos.step);
     benchmark_step.dependOn(&run_durable.step);
+}
+
+/// The statistical regression gate compares two recorded results files
+/// (ZDS 0011): it fails when a candidate run's Hodges-Lehmann shift
+/// confidence bound regresses past the workload's threshold.
+fn addBenchGate(b: *std.Build, test_step: *std.Build.Step) void {
+    const gate_module = b.createModule(.{
+        .root_source_file = b.path("tools/bench-gate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const gate = b.addExecutable(.{
+        .name = "bench-gate",
+        .root_module = gate_module,
+    });
+    const run_gate = b.addRunArtifact(gate);
+    run_gate.has_side_effects = true;
+    if (b.args) |args| run_gate.addArgs(args);
+    const gate_step = b.step(
+        "bench-gate",
+        "Gate a candidate results file against a baseline: " ++
+            "zig build bench-gate -- <baseline.json> <candidate.json>",
+    );
+    gate_step.dependOn(&run_gate.step);
+
+    const gate_tests = b.addTest(.{ .root_module = gate_module });
+    test_step.dependOn(&b.addRunArtifact(gate_tests).step);
 }
 
 fn addFormatting(b: *std.Build) void {
