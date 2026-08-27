@@ -8,9 +8,12 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
-/// Compile-time capacity of the bounded chosen-value buffer.
+/// Compile-time capacity of the bounded chosen-value window.
 pub const Options = struct {
-    /// Maximum chosen slots retained; slots above this bound are rejected.
+    /// Maximum chosen slots resident at once. Slots are global and never
+    /// reset (ZDS 0011); a slot more than `max_entries` ahead of the
+    /// released prefix is transient backpressure, not an error class the
+    /// host can ignore.
     max_entries: usize = 256,
 };
 
@@ -40,9 +43,18 @@ pub fn Learner(comptime Value: type, comptime options: Options) type {
             value: Value,
         };
 
+        /// One slot-tagged window cell; slot zero means empty.
+        pub const Cell = struct {
+            slot: protocol.Slot = 0,
+            value: Value = undefined,
+        };
+
         configuration_id: u64,
-        learned: [options.max_entries]?Value =
-            [_]?Value{null} ** options.max_entries,
+        /// Sliding cell window over global slots: slot `s` lives in cell
+        /// `(s - 1) % max_entries`, tag-checked. A released value stays
+        /// readable until a later slot reuses its cell.
+        learned: [options.max_entries]Cell =
+            [_]Cell{.{}} ** options.max_entries,
         released_through: protocol.Slot = 0,
 
         /// Replaces `self` with an empty learner bound to one configuration;
@@ -66,12 +78,29 @@ pub fn Learner(comptime Value: type, comptime options: Options) type {
             if (configuration_id != self.configuration_id) {
                 return error.ConfigurationMismatch;
             }
-            const index = try slotIndex(slot);
-            if (self.learned[index]) |existing| {
-                if (!std.meta.eql(existing, value)) return error.ConflictingChosenValue;
+            if (slot == 0) return error.InvalidSlot;
+            if (slot <= self.released_through) {
+                // Still resident: the duplicate is still checkable.
+                const cell = &self.learned[cellIndex(slot)];
+                if (cell.slot == slot and !std.meta.eql(cell.value, value)) {
+                    return error.ConflictingChosenValue;
+                }
                 return .duplicate;
             }
-            self.learned[index] = value;
+            if (slot > self.released_through + options.max_entries) {
+                return error.WindowFull;
+            }
+            const cell = &self.learned[cellIndex(slot)];
+            if (cell.slot == slot) {
+                if (!std.meta.eql(cell.value, value)) {
+                    return error.ConflictingChosenValue;
+                }
+                return .duplicate;
+            }
+            // Two distinct resident slots never share a cell, so anything
+            // else in it is a released predecessor the host consumed.
+            std.debug.assert(cell.slot <= self.released_through);
+            cell.* = .{ .slot = slot, .value = value };
             const before = self.released_through;
             self.advanceReleasedPrefix();
             self.assertValid();
@@ -87,28 +116,38 @@ pub fn Learner(comptime Value: type, comptime options: Options) type {
             self.assertValid();
             if (from_slot == 0) return error.InvalidSlot;
             if (from_slot > self.released_through) return output[0..0];
+            // A released slot whose cell was reused by a buffered later
+            // slot has left the window; the host consumed it or must
+            // recover it from its own journal.
+            if (from_slot + options.max_entries <= self.released_through) {
+                return error.Trimmed;
+            }
             const count: usize = @intCast(self.released_through - from_slot + 1);
             if (output.len < count) return error.ReadBufferTooSmall;
             for (output[0..count], 0..) |*chosen, offset| {
                 const slot = from_slot + @as(protocol.Slot, @intCast(offset));
-                chosen.* = .{ .slot = slot, .value = self.learned[slot - 1].? };
+                const cell = &self.learned[cellIndex(slot)];
+                if (cell.slot != slot) return error.Trimmed;
+                chosen.* = .{ .slot = slot, .value = cell.value };
             }
             return output[0..count];
         }
 
-        /// Returns a released chosen value. Buffered values above the
-        /// contiguous prefix stay hidden until the gap below them fills, so
-        /// applications never observe out-of-order state.
+        /// Returns a released chosen value still resident in the window.
+        /// Buffered values above the contiguous prefix stay hidden until
+        /// the gap below them fills, so applications never observe
+        /// out-of-order state.
         pub fn chosenAt(self: *const Self, slot: protocol.Slot) ?Value {
-            const index = slotIndex(slot) catch return null;
-            if (slot > self.released_through) return null;
-            return self.learned[index];
+            if (slot == 0 or slot > self.released_through) return null;
+            const cell = &self.learned[cellIndex(slot)];
+            if (cell.slot != slot) return null;
+            return cell.value;
         }
 
         fn advanceReleasedPrefix(self: *Self) void {
-            while (self.released_through < options.max_entries) {
+            while (true) {
                 const next = self.released_through + 1;
-                if (self.learned[next - 1] == null) return;
+                if (self.learned[cellIndex(next)].slot != next) return;
                 self.released_through = next;
             }
         }
@@ -116,15 +155,10 @@ pub fn Learner(comptime Value: type, comptime options: Options) type {
         fn assertValid(self: *const Self) void {
             if (!std.debug.runtime_safety) return;
             std.debug.assert(self.configuration_id > 0);
-            std.debug.assert(self.released_through <= options.max_entries);
-            for (0..self.released_through) |index| {
-                std.debug.assert(self.learned[index] != null);
-            }
         }
 
-        fn slotIndex(slot: protocol.Slot) !usize {
-            if (slot == 0 or slot > options.max_entries) return error.InvalidSlot;
-            return @intCast(slot - 1);
+        fn cellIndex(slot: protocol.Slot) usize {
+            return @intCast((slot - 1) % options.max_entries);
         }
     };
 }
@@ -143,6 +177,34 @@ test "learner releases only a contiguous chosen prefix" {
         error.ConflictingChosenValue,
         learner.learnChosen(7, 2, 23),
     );
+}
+
+test "learner window wraps across global slots" {
+    const L = Learner(u64, .{ .max_entries = 4 });
+    var learner: L = undefined;
+    try learner.init(7);
+
+    // Fill and release well past the window capacity.
+    for (1..11) |slot| {
+        _ = try learner.learnChosen(7, @intCast(slot), @as(u64, slot) * 10);
+    }
+    try std.testing.expectEqual(@as(protocol.Slot, 10), learner.released_through);
+    try std.testing.expectEqual(@as(?u64, 100), learner.chosenAt(10));
+    // Slot 5's cell was reused by slot 9; the value left the window.
+    try std.testing.expectEqual(@as(?u64, null), learner.chosenAt(5));
+    var output: [4]L.Chosen = undefined;
+    try std.testing.expectError(error.Trimmed, learner.readChosen(5, &output));
+
+    // Backpressure, not corruption, beyond the resident window.
+    try std.testing.expectError(
+        error.WindowFull,
+        learner.learnChosen(7, 15, 150),
+    );
+    // A gap stalls release; filling it resumes.
+    _ = try learner.learnChosen(7, 12, 120);
+    try std.testing.expectEqual(@as(protocol.Slot, 10), learner.released_through);
+    try std.testing.expectEqual(.advanced, try learner.learnChosen(7, 11, 110));
+    try std.testing.expectEqual(@as(protocol.Slot, 12), learner.released_through);
 }
 
 test "learner rejects messages from another configuration" {
