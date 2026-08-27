@@ -206,6 +206,25 @@ runs support the bounded result: `MaxSlot = 4` at bound eighteen
 explored 963 million states to depth 14, and at bound twenty-two 210
 million states to depth 13, with no violation before being stopped.
 
+The exhaustive `GlobalTrim.cfg` sweep is in progress and parked at a
+TLC checkpoint (2026-08-27, TLC 2.14): 184 million states generated,
+26.2 million distinct, depth 13, every invariant holding, resumable
+with `-recover` from the saved metadir (see
+`~/tlc-checkpoints/GlobalTrim-20260827/RESUME.md`; the checkpoint moves
+between machines as long as the spec, config, and `tla2tools.jar` are
+identical). The `GlobalTrim5.cfg` sweep runs after it. When completing
+these on a larger machine, raise `-workers` and `-Xmx`, and consider a
+`SYMMETRY` set over the interchangeable data voters, which is sound for
+the safety invariants and the `Monotone` action property checked here.
+
+For unbounded-depth results in minutes instead of enumeration hours,
+the follow-up is Apalache's inductive mode: annotate the spec with
+Apalache types, strengthen `Agreement` and
+`LeaderNeverProposesAtOrBelowAnchor` into an inductive invariant, and
+check `Init => Inv` and `Inv /\ Next => Inv'` as two SMT queries. The
+strengthening is the real work; TLC remains the tool for the
+deliberate-bug validations below.
+
 The invariants are not vacuous: removing the eviction guard's
 chosen-and-below-floor condition makes TLC report
 `AcceptedOnlySlotNeverEvicted` in an eight-state trace, and removing
