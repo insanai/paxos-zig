@@ -23,12 +23,12 @@ function finish_function(end_line, line_count, name) {
 }
 
 # A file stays below 2800 lines of code, counting neither comment-only
-# lines nor blanks. The two grandfathered hosts are pinned at their
-# current size and may only shrink; the pins are recorded debt, not
-# policy.
+# lines nor blanks. The two grandfathered hosts are pinned at exactly
+# their current size, so they can only shrink; re-pin to the new count
+# after each accepted shrink. The pins are recorded debt, not policy.
 function file_code_limit(name) {
-    if (name ~ /zaxonlite\/src\/server\.zig$/) return 4650
-    if (name ~ /zaxonlite\/src\/node\.zig$/) return 3350
+    if (name ~ /zaxonlite\/src\/server\.zig$/) return 4622
+    if (name ~ /zaxonlite\/src\/node\.zig$/) return 3335
     return 2800
 }
 
