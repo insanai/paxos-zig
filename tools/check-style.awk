@@ -22,7 +22,20 @@ function finish_function(end_line, line_count, name) {
     function_count--
 }
 
+# A file stays below 2800 lines of code, counting neither comment-only
+# lines nor blanks. The two grandfathered hosts are pinned at their
+# current size and may only shrink; the pins are recorded debt, not
+# policy.
+function file_code_limit(name) {
+    if (name ~ /zaxonlite\/src\/server\.zig$/) return 4650
+    if (name ~ /zaxonlite\/src\/node\.zig$/) return 3350
+    return 2800
+}
+
 {
+    if ($0 !~ /^[[:space:]]*(\/\/|$)/) {
+        code_lines++
+    }
     if (length($0) > 100) {
         printf "%s:%d: line is %d columns; maximum is 100\n", \
             FILENAME, FNR, length($0)
@@ -58,5 +71,10 @@ function finish_function(end_line, line_count, name) {
 }
 
 END {
+    if (code_lines > file_code_limit(FILENAME)) {
+        printf "%s: %d lines of code; maximum is %d (comments excluded)\n", \
+            FILENAME, code_lines, file_code_limit(FILENAME)
+        failed = 1
+    }
     if (failed) exit 1
 }
