@@ -187,6 +187,39 @@ fn usageError(err_out: *Io.Writer, message: []const u8) !u8 {
 
 const SampleSource = enum { raw, window_quantiles, batch_quantiles, total_span };
 
+/// Environment fields compared across the two files; any of them may be
+/// absent from older recordings.
+const meta_field_names = [_][]const u8{ "host", "cpu", "os", "zig" };
+
+const Meta = struct {
+    fields: [meta_field_names.len]?[]const u8 = @splat(null),
+};
+
+const Loaded = struct {
+    runs: []Run,
+    meta: Meta,
+};
+
+/// Differing recording environments make a shift unattributable to the
+/// code; the mismatch is loudly reported but never fails the gate.
+fn warnEnvironment(base: Meta, cand: Meta, out: *Io.Writer) !void {
+    var mismatched = false;
+    for (meta_field_names, base.fields, cand.fields) |name, base_field, cand_field| {
+        const baseline_text = base_field orelse continue;
+        const candidate_text = cand_field orelse continue;
+        if (std.mem.eql(u8, baseline_text, candidate_text)) continue;
+        mismatched = true;
+        try out.print(
+            "WARNING: environment mismatch on {s}: baseline \"{s}\" vs candidate \"{s}\"\n",
+            .{ name, baseline_text, candidate_text },
+        );
+    }
+    if (mismatched) {
+        try out.writeAll("WARNING: shifts across differing environments may reflect " ++
+            "the machine, not the code (warning only, never a failure)\n");
+    }
+}
+
 const Run = struct {
     workload: []const u8,
     mode: []const u8,
@@ -204,7 +237,7 @@ fn loadRuns(
     io: Io,
     path: []const u8,
     err_out: *Io.Writer,
-) ![]Run {
+) !Loaded {
     const bytes = Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -236,7 +269,17 @@ fn loadRuns(
         const record = try extractRun(alloc, item) orelse continue;
         try runs.append(alloc, record);
     }
-    return runs.items;
+    return .{ .runs = runs.items, .meta = extractMeta(parsed.object) };
+}
+
+fn extractMeta(object: std.json.ObjectMap) Meta {
+    var meta = Meta{};
+    const meta_value = object.get("meta") orelse return meta;
+    if (meta_value != .object) return meta;
+    for (meta_field_names, &meta.fields) |name, *slot| {
+        slot.* = stringField(meta_value.object, name);
+    }
+    return meta;
 }
 
 fn extractRun(alloc: std.mem.Allocator, value: std.json.Value) !?Run {
