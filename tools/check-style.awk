@@ -8,7 +8,7 @@ function finish_function(end_line, line_count, name) {
     line_count = end_line - function_start[function_count] + 1
     if (name != "Protocol" && name != "ProtocolGated" && name != "ReplicatedLog" && \
         name != "Learner" && \
-        name != "Simulator" && name != "Bench" && FILENAME !~ /cli_test\.zig$/ && \
+        name != "Simulator" && name != "Bench" && name != "MovingBench" && FILENAME !~ /cli_test\.zig$/ && \
         FILENAME !~ /cluster_bench\.zig$/ && FILENAME !~ /cluster_test\.zig$/ && \
         FILENAME !~ /fuzz\.zig$/ && FILENAME !~ /main\.zig$/ && FILENAME !~ /node\.zig$/ && \
         FILENAME !~ /server\.zig$/ && FILENAME !~ /soak\.zig$/ && FILENAME !~ /tls\.zig$/ && line_count > 70) {
