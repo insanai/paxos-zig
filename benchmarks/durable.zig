@@ -309,6 +309,13 @@ fn encode(write: P.Write, out: []u8) void {
             slot = record.slot;
             value = record.value;
         },
+        // The durable workload never installs a chosen trim; the fixed
+        // 37-byte record is part of the recorded-results protocol and
+        // must not grow for a write this harness cannot produce.
+        .trim_anchor => std.debug.panic(
+            "trim anchors are not part of the durable workload",
+            .{},
+        ),
     }
     out[0] = tag;
     std.mem.writeInt(u64, out[1..9], ballot.round, .little);
