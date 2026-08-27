@@ -1,6 +1,6 @@
 .{
     .name = .paxos,
-    .version = "0.2.2",
+    .version = "0.3.0",
     .fingerprint = 0xcde1e9b27d8c32ff, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

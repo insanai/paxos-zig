@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+paxos-zig 0.3.0 and zaxonlite 0.4.0 (ZDS 0011). This is a breaking format
+cut with no bridge: wire protocol 9, journal format 2, and the new durable
+state anchor replace their predecessors, and artifacts from earlier
+releases fail closed at open.
+
+- Replace the bounded epoch with a single `u64` global slot line that is
+  never reset. The core keeps a fixed slot-tagged consensus window
+  (`window_slots`, a power of two) with a host-licensed memory floor;
+  `max_slots` and the 2,044-commit rollover are gone, and with them the
+  write-path cost proportional to database size.
+- Add chunked leader recovery (`PromiseRange`) with the trimmed-acceptor
+  fences: an elected leader never proposes at or below the maximum quorum
+  trim anchor or chosen-through. Message and write capacities derive from
+  the recovery chunk, not the log length.
+- Add certified log trimming: replicas publish durable-state reports, the
+  leader proposes the conservative trim `G = min A_i` over data replicas
+  as an ordinary chosen entry, and segments wholly below the adopted trim
+  are physically unlinked with payload garbage collection behind them.
+- Replace the epoch journal with a segmented, manifest-governed journal
+  (`consensus/`): first-slot-named segments, sealed trailers carrying a
+  `max_promised` ballot rollup, rename-free rotation, and orphan sweeps.
+  Replay folds the lifetime journal across configuration changes and
+  window reuse.
+- Add the alternating durable state anchor (`APPLIED.0/1`): recovery
+  replays only the journal suffix above the anchor, so startup cost
+  follows the anchor cadence instead of the whole history.
+- Add the domain-separated global history hash `H_s`, folding each
+  transaction batch's result chain, with per-slot recent marks for
+  quorum vouching.
+- Rewire decided voter replacement (ZDS 0008) onto global slots: the stop
+  sign carries only the next registry digest and the replacement seed,
+  survivors continue the same slot line in place, and the joining voter
+  fetches the decided registry and catches up from the retained journal.
+  Snapshot generations, `CURRENT` pointers, and per-configuration
+  journals are gone.
+- Add the anchor-pinned state transfer for gaps beyond journal retention:
+  the sender pins a fresh anchor and a private image copy, and the
+  receiver installs only after a read quorum vouches the anchor's history
+  binding and the image digest matches. The stop-sign checkpoint proof
+  and its quorum probe are removed.
+- Rename the `snapshot` CLI verb to `anchor`; `zaxonlite_snapshot`
+  becomes `zaxonlite_state_anchor` in the C ABI. Status output reports
+  the global frontier fields (`durable_state_slot`, `memory_floor`,
+  `chosen_trim_slot`, `retained_first_slot`, journal totals) instead of
+  epoch capacity. Slot fields in the JSON status are `u64`; readers that
+  parse them as IEEE doubles lose precision past 2^53.
+- Extend the crash matrix over the anchor, trim, reclamation, and payload
+  GC failpoints (15 cases), add the nightly long-run retention gate
+  (segment rotation, bounded retention, anchored restart), and add the
+  moving-window benchmark family (256 window wraps on one slot line).
+- Model the design in `specs/GlobalTrim.tla`: the slot-tagged window,
+  eviction licensing, trimmed-acceptor election fences, conservative
+  trim, and the joiner lease lifecycle, with deliberate-bug validation.
+
 ## 0.2.0 - 2026-07-30
 
 - Add the native `zxlite` Python SDK for CPython 3.12 and newer, including a
