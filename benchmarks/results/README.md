@@ -42,3 +42,17 @@ toolchain versions. A dirty result is useful during development but is not an
 archival comparison point: after committing benchmark changes, rerun once more
 so the recorded revision contains the exact measured source. Results without
 that context are not comparable and should not be committed.
+
+## Regression gating
+
+After recording a candidate file, run
+`zig build bench-gate -- <baseline.json> <candidate.json>` against the
+last committed archival file before publishing numbers or merging a
+performance-relevant change. The gate estimates the Hodges-Lehmann shift
+per workload/mode with a deterministic percentile-bootstrap 95%
+confidence interval. Only pairs where both records carry the raw
+`samples_ns_per_value` array gate (exit nonzero on regression); files
+recorded before that field existed expose only summary quantiles and are
+compared report-only, never affecting the exit code. The tool also warns,
+without failing, when the two files were recorded on different hosts or
+toolchains — such shifts are not attributable to the code.

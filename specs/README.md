@@ -169,9 +169,14 @@ slot continuity across a stop sign is checked by
 |                       | over counted data replicas, `trim.candidate`)       |
 | `InstallTrim`         | `installChosenTrim` plus the durable TRIM record    |
 | `LocalDelete`         | segment unlink under `trim.deleteFloor`             |
-| `CreateLease` /       | transfer-lease lifecycle: chosen lease entry,       |
-| `InstallJoiner` /     | pinned image install at the base slot, completion   |
-| `CompleteLease`       | only after the receiver's anchor reaches `G`        |
+| `CreateLease` /       | joiner transfer lifecycle. The lease actions map to |
+| `InstallJoiner` /     | reserved v1 machinery (no runtime path proposes a   |
+| `CompleteLease`       | lease; the conservative trim provides the freeze),  |
+|                       | while `InstallJoiner` maps to the anchor-pinned     |
+|                       | image install at the sender's base slot             |
+| `InstallVoter`        | `installTransferredState` +                         |
+|                       | `continueOnConfigurationPreserving` (in-place       |
+|                       | repair, promise and votes above the base preserved) |
 
 Checked invariants: `Agreement` and `ChosenPrefix` (no commit ever
 contradicts the first decision; claimed prefixes are chosen),
@@ -232,14 +237,15 @@ check `Init => Inv` and `Inv /\ Next => Inv'` as two SMT queries. The
 strengthening is the real work; TLC remains the tool for the
 deliberate-bug validations below.
 
-A second open extension: the spec models state transfer only for a
-joiner with empty consensus state (`InstallJoiner` requires
-`applied[Joiner] = 0`). The implementation additionally allows an
-established voter to install a transferred image in place, preserving
-its promise and its votes above the transfer anchor; an `InstallVoter`
-action carrying that preservation rule (promise unchanged, cells above
-the base retained, cells at or below it discharged by the anchor)
-would bring the in-place path under the model.
+The in-place voter transfer is modeled: `InstallVoter` carries the
+preservation rule (promise unchanged, cells above the base retained,
+accepted-only cells at or below it discharged by the anchor), matching
+`installTransferredState` plus `continueOnConfigurationPreserving`.
+Its validation pair is queued on the verification machine behind the
+exhaustive base sweep: a deliberate-bug variant restoring the
+pre-audit reset behavior (which must produce a counterexample) and a
+checkpointed clean sweep of the extended spec at the full bound; bank
+both results here when they land.
 
 The invariants are not vacuous: removing the eviction guard's
 chosen-and-below-floor condition makes TLC report
