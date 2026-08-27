@@ -232,6 +232,15 @@ check `Init => Inv` and `Inv /\ Next => Inv'` as two SMT queries. The
 strengthening is the real work; TLC remains the tool for the
 deliberate-bug validations below.
 
+A second open extension: the spec models state transfer only for a
+joiner with empty consensus state (`InstallJoiner` requires
+`applied[Joiner] = 0`). The implementation additionally allows an
+established voter to install a transferred image in place, preserving
+its promise and its votes above the transfer anchor; an `InstallVoter`
+action carrying that preservation rule (promise unchanged, cells above
+the base retained, cells at or below it discharged by the anchor)
+would bring the in-place path under the model.
+
 The invariants are not vacuous: removing the eviction guard's
 chosen-and-below-floor condition makes TLC report
 `AcceptedOnlySlotNeverEvicted` in an eight-state trace, and removing
