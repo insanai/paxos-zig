@@ -62,10 +62,202 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "pipeline8", .window = 8 },
     });
 
+    // The moving-window workload never resets: 256 window wraps on one
+    // global slot line, floors advancing as the host consumes (ZDS 0011).
+    // Latency percentiles across batches are the direct no-cliff check —
+    // window reuse must cost the same at wrap 256 as at wrap 1.
+    const Moving = MovingBench(3, 1_024, 64, 262_144);
+    failures += try Moving.run(io, "u64-3n-moving");
+
     if (failures > 0) {
         std.debug.print("benchmark self-checks failed: {d}\n", .{failures});
         std.process.exit(1);
     }
+}
+
+/// A wrapping workload over one global slot line: batches of `batch`
+/// values, floors advanced after every drain, `total` values across
+/// `total / window_slots` window wraps. Checksums accumulate at release
+/// time on every replica, because the window no longer retains history.
+fn MovingBench(
+    comptime node_count: comptime_int,
+    comptime window_slots: usize,
+    comptime batch: u64,
+    comptime total: u64,
+) type {
+    const P = paxos.Protocol(u64, .{
+        .max_members = node_count,
+        .window_slots = window_slots,
+        .recovery_chunk_slots = 256,
+    });
+    const queue_capacity = 8_192;
+    const batch_count = total / batch;
+    const moving_samples = 3;
+
+    return struct {
+        const State = struct {
+            membership: P.Membership,
+            nodes: [node_count]P.Node,
+            disks: [node_count]P.DurableState,
+            effects: P.Effects,
+            queue: [queue_capacity]P.Envelope,
+            queue_count: usize,
+            message_count: u64,
+            released: [node_count]u64,
+            delivered: [node_count]u64,
+            batch_ns: [batch_count]u64,
+        };
+
+        var state: State = undefined;
+
+        fn run(io: std.Io, workload: []const u8) !u32 {
+            var totals: [moving_samples]u64 = undefined;
+            for (&totals) |*nanoseconds| nanoseconds.* = try runSample(io);
+            std.mem.sort(u64, &totals, {}, std.sort.asc(u64));
+            const median = totals[moving_samples / 2];
+
+            const s = &state;
+            std.mem.sort(u64, &s.batch_ns, {}, std.sort.asc(u64));
+            const per_batch = [4]u64{
+                s.batch_ns[batch_count / 2],
+                s.batch_ns[batch_count * 9 / 10],
+                s.batch_ns[batch_count * 99 / 100],
+                s.batch_ns[batch_count - 1],
+            };
+            const ns_per_value =
+                @as(f64, @floatFromInt(median)) / @as(f64, @floatFromInt(total));
+            std.debug.print(
+                \\
+                \\workload:       {s} mode=batch{d} (Zig Multi-Paxos {s})
+                \\values:         {d} nodes={d} window_slots={d} wraps={d}
+                \\median_ns:      {d} across {d} samples
+                \\ns_per_value:   {d:.2}
+                \\batch-average ns/value p50/p90/p99/max: {d}/{d}/{d}/{d}
+                \\
+            , .{
+                workload,               batch,
+                paxos.version,          total,
+                node_count,             window_slots,
+                total / window_slots,   median,
+                moving_samples,         ns_per_value,
+                per_batch[0] / batch,   per_batch[1] / batch,
+                per_batch[2] / batch,   per_batch[3] / batch,
+            });
+            std.debug.print(
+                "{{\"impl\":\"paxos-zig\",\"workload\":\"{s}\"," ++
+                    "\"mode\":\"batch{d}\",\"values\":{d},\"nodes\":{d}," ++
+                    "\"payload_bytes\":8,\"window_slots\":{d},\"wraps\":{d}," ++
+                    "\"ns_total_median\":{d},\"ns_per_value\":{d:.2}," ++
+                    "\"batch_ns_per_value_p50\":{d},\"batch_ns_per_value_p90\":{d}," ++
+                    "\"batch_ns_per_value_p99\":{d},\"batch_ns_per_value_max\":{d}}}\n",
+                .{
+                    workload,             batch,
+                    total,                node_count,
+                    window_slots,         total / window_slots,
+                    median,               ns_per_value,
+                    per_batch[0] / batch, per_batch[1] / batch,
+                    per_batch[2] / batch, per_batch[3] / batch,
+                },
+            );
+            return 0;
+        }
+
+        fn runSample(io: std.Io) !u64 {
+            const s = &state;
+            try s.membership.init(memberIdsOf(node_count));
+            inline for (0..node_count) |index| {
+                try s.nodes[index].init(@intCast(index + 1), &s.membership);
+            }
+            s.disks = [_]P.DurableState{.{}} ** node_count;
+            s.effects.init();
+            s.queue_count = 0;
+            s.message_count = 0;
+            s.released = [_]u64{0} ** node_count;
+            s.delivered = [_]u64{0} ** node_count;
+
+            try s.nodes[0].campaign(0, &s.effects);
+            try consume(0);
+            try drain();
+            std.debug.assert(s.nodes[0].role == .leader);
+
+            const started = std.Io.Clock.Timestamp.now(io, .awake);
+            var previous = started;
+            var seq: u64 = 1;
+            var batch_index: usize = 0;
+            while (seq <= total) : (seq += batch) {
+                var values: [batch]u64 = undefined;
+                var slots: [batch]paxos.Slot = undefined;
+                for (0..batch) |offset| values[offset] = seq + offset;
+                _ = try s.nodes[0].proposeBatch(&values, &slots, &s.effects);
+                try consume(0);
+                try drain();
+                // The host has applied and journaled everything released:
+                // license cell reuse so the window keeps moving.
+                inline for (0..node_count) |index| {
+                    try s.nodes[index].advanceMemoryFloor(
+                        s.nodes[index].decidedThrough(),
+                    );
+                }
+                const now = std.Io.Clock.Timestamp.now(io, .awake);
+                s.batch_ns[batch_index] =
+                    @intCast(previous.durationTo(now).raw.nanoseconds);
+                previous = now;
+                batch_index += 1;
+            }
+            const finished = std.Io.Clock.Timestamp.now(io, .awake);
+
+            const expected = total * (total + 1) / 2;
+            inline for (0..node_count) |index| {
+                if (s.released[index] != expected or
+                    s.delivered[index] != total)
+                {
+                    return error.ReplicaDivergence;
+                }
+            }
+            return @intCast(started.durationTo(finished).raw.nanoseconds);
+        }
+
+        fn drain() !void {
+            const s = &state;
+            var head: usize = 0;
+            while (head < s.queue_count) : (head += 1) {
+                const envelope = s.queue[head];
+                const node_index: usize = envelope.to - 1;
+                try s.nodes[node_index].step(envelope, &s.effects);
+                try consume(node_index);
+            }
+            s.queue_count = 0;
+        }
+
+        fn consume(node_index: usize) !void {
+            const s = &state;
+            for (s.effects.writesSlice()) |write| {
+                try s.disks[node_index].apply(write);
+            }
+            s.effects.confirmWritesDurable();
+            for (s.effects.committedSlice()) |committed| {
+                if (committed.slot != 0) {
+                    s.released[node_index] +%= committed.value;
+                    s.delivered[node_index] += 1;
+                }
+            }
+            for (s.effects.messagesSlice()) |message| {
+                if (s.queue_count == s.queue.len) return error.QueueFull;
+                s.queue[s.queue_count] = message;
+                s.queue_count += 1;
+                s.message_count += 1;
+            }
+        }
+    };
+}
+
+fn memberIdsOf(comptime node_count: comptime_int) []const paxos.NodeId {
+    const ids = comptime blk: {
+        var storage: [node_count]paxos.NodeId = undefined;
+        for (&storage, 1..) |*id, id_value| id.* = id_value;
+        break :blk storage;
+    };
+    return &ids;
 }
 
 /// Fixed-size payload carrying a sequence number for checksumming.
