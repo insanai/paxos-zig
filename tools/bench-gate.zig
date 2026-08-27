@@ -3,8 +3,9 @@
 //!
 //! Compares a baseline and a candidate results file (the JSON emitted into
 //! benchmarks/results/) and exits nonzero only when a matched paxos-zig
-//! run whose records BOTH carry a raw `samples_ns_per_value` array
-//! regresses. Per workload/mode pair the Hodges-Lehmann shift between the
+//! run whose records BOTH carry a raw `samples_ns_per_value` array of at
+//! least 32 observations, recorded in matching environments, regresses.
+//! Per matched pair the Hodges-Lehmann shift between the
 //! two sample vectors is estimated with a percentile-bootstrap 95%
 //! confidence interval under a fixed PRNG seed, so repeated invocations
 //! reproduce the same interval bit for bit. (The verification plan asks
@@ -12,6 +13,13 @@
 //! and BCa correction is deliberately not required.) An enforced pair
 //! fails when the interval's upper bound exceeds +3% of the baseline
 //! median for in-memory workloads or +5% for durable workloads.
+//!
+//! Pairs are matched on workload and mode plus every fixture-defining
+//! numeric field both records carry (values, nodes, payload_bytes,
+//! values_per_iteration, measurement_iterations, max_slots, window_slots,
+//! wraps). A pair differing in any present fixture field describes two
+//! different experiments; it is skipped with a printed reason and never
+//! compared.
 //!
 //! Runs recorded before the raw field existed expose only summary
 //! statistics: the window or batch p50/p90/p99/max quantiles, or
@@ -26,17 +34,29 @@
 //! (median of Walsh averages) over the per-quantile differences,
 //! bootstrapped by resampling those differences. Raw sample arrays use
 //! the two-sample form (median of all pairwise differences) with
-//! independent resampling of each side.
+//! independent resampling of each side. A raw pair where either side has
+//! fewer than 32 observations is likewise report-only ("insufficient
+//! samples"): the bootstrap interval of a tiny sample is too fragile to
+//! gate on.
 //!
 //! When both files record environment metadata (meta host, cpu, os, zig)
-//! any difference is printed as a prominent warning — cross-environment
-//! shifts are not attributable to the code — but never fails the gate.
+//! any difference downgrades every raw pair to report-only with a printed
+//! reason — cross-environment shifts are not attributable to the code —
+//! and is never a hard failure.
 //!
-//! The periodicity check needs the candidate's per-batch series (optional
-//! `batch_ns_series` array). The recorded protocol is percentile-only
-//! today, so without the series the check reports itself skipped and never
-//! fails the gate; with it, autocorrelation is reported at the window-wrap
-//! and applied-anchor cadences against a predeclared report-only threshold.
+//! Within one run the window/batch observations share a single process
+//! lifetime and are autocorrelated, so the ordinary bootstrap used here
+//! understates the true variance of the shift. The interval is reported
+//! exactly as computed and never widened silently; the gold standard for
+//! confirming a suspected shift is repeated same-fixture runs (a fresh
+//! process per recording) compared across result files.
+//!
+//! The periodicity check reads the candidate's per-batch series (optional
+//! `batch_ns_series` array, emitted by the u64-3n-moving workload in
+//! benchmarks/benchmark.zig). Runs recorded before the field existed lack
+//! it; the check then reports itself skipped and never fails the gate.
+//! With the series, autocorrelation is reported at the window-wrap and
+//! applied-anchor cadences against a predeclared report-only threshold.
 
 const std = @import("std");
 const Io = std.Io;
@@ -55,24 +75,39 @@ const usage_text =
     \\  batch_ns_per_value_p50/p90/p99/max    moving-window runs
     \\  ns_total_min/median/max divided by "values"   durable runs
     \\
-    \\Runs lacking every source are ignored. The gate is the bootstrap 95%
-    \\upper confidence bound of the Hodges-Lehmann shift: it must stay at
-    \\or below +3% of the baseline median, or +5% for workloads whose name
-    \\starts with "durable". Only pairs where BOTH runs carry the raw
-    \\samples_ns_per_value array are enforced (exit 1 on regression).
-    \\Pairs matched through summary quantiles are printed as
-    \\"report-only: summary quantiles, not a sample" and never affect the
-    \\exit code. Quantile summaries are compared as paired per-quantile
-    \\differences; raw arrays as all pairwise differences.
+    \\Runs lacking every source are ignored. Runs pair on workload and
+    \\mode plus every fixture-defining numeric field both records carry
+    \\(values, nodes, payload_bytes, values_per_iteration,
+    \\measurement_iterations, max_slots, window_slots, wraps); a pair
+    \\differing in any present fixture field is skipped with a printed
+    \\reason instead of being compared.
     \\
-    \\When both files carry meta host/tool fields (host, cpu, os, zig), a
-    \\mismatch prints a prominent warning without failing the gate.
+    \\The gate is the bootstrap 95% upper confidence bound of the
+    \\Hodges-Lehmann shift: it must stay at or below +3% of the baseline
+    \\median, or +5% for workloads whose name starts with "durable". Only
+    \\pairs where BOTH runs carry at least 32 raw samples_ns_per_value
+    \\observations, recorded in matching environments, are enforced (exit
+    \\1 on regression). Every other matched pair is report-only and never
+    \\affects the exit code: summary-quantile pairs, raw pairs below 32
+    \\observations ("insufficient samples (N < 32)"), and every pair when
+    \\the meta host/cpu/os/zig fields differ between the files. Durable
+    \\rows record only ns_total min/median/max today (no per-operation
+    \\timing array exists in benchmarks/durable.zig), so durable pairs
+    \\stay report-only until their producer records raw samples. Quantile
+    \\summaries are compared as paired per-quantile differences; raw
+    \\arrays as all pairwise differences.
     \\
-    \\The autocorrelation check reads an optional per-batch
-    \\"batch_ns_series" array from candidate runs; --wrap-lag and
-    \\--anchor-lag override the lags derived from "wraps" and the
-    \\10000-slot anchor cadence. Without the series the check is reported
-    \\as skipped and never fails the gate.
+    \\Within-run observations share one process lifetime and are
+    \\autocorrelated, so the bootstrap interval understates variance; it
+    \\is never widened silently. Confirm a suspected shift with repeated
+    \\same-fixture runs recorded into separate result files.
+    \\
+    \\The autocorrelation check reads the optional per-batch
+    \\"batch_ns_series" array from candidate runs (emitted by the
+    \\u64-3n-moving workload); --wrap-lag and --anchor-lag override the
+    \\lags derived from "wraps" and the 10000-slot anchor cadence.
+    \\Without the series the check is reported as skipped and never fails
+    \\the gate.
     \\
 ;
 
@@ -84,6 +119,10 @@ const bootstrap_iterations = 2000;
 
 const in_memory_limit: f64 = 0.03;
 const durable_limit: f64 = 0.05;
+
+/// Raw pairs where either side records fewer observations than this are
+/// too fragile to gate on and downgrade to report-only.
+const min_raw_samples = 32;
 
 /// Predeclared report-only autocorrelation threshold for periodicity.
 const autocorrelation_flag = 0.2;
@@ -162,8 +201,8 @@ fn run(
         "bench-gate: baseline {s} ({d} comparable runs), candidate {s} ({d} comparable runs)\n",
         .{ baseline_path, baseline.runs.len, candidate_path, candidate.runs.len },
     );
-    try warnEnvironment(baseline.meta, candidate.meta, out);
-    return gateAll(alloc, baseline.runs, candidate.runs, lags, out);
+    const env_mismatch = try warnEnvironment(baseline.meta, candidate.meta, out);
+    return gateAll(alloc, baseline.runs, candidate.runs, lags, env_mismatch, out);
 }
 
 fn lagValue(iterator: *std.process.Args.Iterator, err_out: *Io.Writer) !?usize {
@@ -201,8 +240,9 @@ const Loaded = struct {
 };
 
 /// Differing recording environments make a shift unattributable to the
-/// code; the mismatch is loudly reported but never fails the gate.
-fn warnEnvironment(base: Meta, cand: Meta, out: *Io.Writer) !void {
+/// code; the mismatch is loudly reported and every raw pair downgrades
+/// to report-only, but the gate never hard-fails on it.
+fn warnEnvironment(base: Meta, cand: Meta, out: *Io.Writer) !bool {
     var mismatched = false;
     for (meta_field_names, base.fields, cand.fields) |name, base_field, cand_field| {
         const baseline_text = base_field orelse continue;
@@ -216,9 +256,22 @@ fn warnEnvironment(base: Meta, cand: Meta, out: *Io.Writer) !void {
     }
     if (mismatched) {
         try out.writeAll("WARNING: shifts across differing environments may reflect " ++
-            "the machine, not the code (warning only, never a failure)\n");
+            "the machine, not the code; raw pairs downgrade to report-only\n");
     }
+    return mismatched;
 }
+
+/// Fixture-defining numeric fields: two runs describe the same experiment
+/// only when every one of these carried by both records is equal. The
+/// result families differ (matrix runs carry values_per_iteration and
+/// max_slots, the moving run window_slots and wraps, durable runs
+/// neither), so only fields present on both sides are compared.
+const fixture_field_names = [_][]const u8{
+    "values",       "nodes",
+    "payload_bytes", "values_per_iteration",
+    "measurement_iterations", "max_slots",
+    "window_slots",  "wraps",
+};
 
 const Run = struct {
     workload: []const u8,
@@ -230,6 +283,8 @@ const Run = struct {
     series: ?[]f64,
     values: f64,
     wraps: f64,
+    /// Fixture fields in `fixture_field_names` order; null when absent.
+    fixture: [fixture_field_names.len]?f64,
 };
 
 fn loadRuns(
@@ -290,6 +345,10 @@ fn extractRun(alloc: std.mem.Allocator, value: std.json.Value) !?Run {
     const workload = stringField(object, "workload") orelse return null;
     const mode = stringField(object, "mode") orelse return null;
     const vector = try sampleVector(alloc, object) orelse return null;
+    var fixture: [fixture_field_names.len]?f64 = undefined;
+    for (fixture_field_names, &fixture) |name, *slot| {
+        slot.* = numberField(object, name);
+    }
     return .{
         .workload = workload,
         .mode = mode,
@@ -299,6 +358,7 @@ fn extractRun(alloc: std.mem.Allocator, value: std.json.Value) !?Run {
         .series = try floatArray(alloc, object, "batch_ns_series"),
         .values = numberField(object, "values") orelse 0,
         .wraps = numberField(object, "wraps") orelse 0,
+        .fixture = fixture,
     };
 }
 
@@ -394,17 +454,25 @@ fn gateAll(
     baseline: []const Run,
     candidate: []const Run,
     lags: Lags,
+    env_mismatch: bool,
     out: *Io.Writer,
 ) !u8 {
     var gated: usize = 0;
     var report_only: usize = 0;
     var failures: usize = 0;
     var series_seen = false;
-    for (candidate) |cand| {
+    for (candidate) |*cand| {
         const base = findRun(baseline, cand.workload, cand.mode) orelse {
             try out.print("skip {s}/{s}: not in baseline\n", .{ cand.workload, cand.mode });
             continue;
         };
+        if (fixtureMismatch(base, cand)) |diff| {
+            try out.print(
+                "skip {s}/{s}: fixture mismatch on {s} (baseline {d} vs candidate {d})\n",
+                .{ cand.workload, cand.mode, diff.name, diff.base, diff.cand },
+            );
+            continue;
+        }
         if (base.source != cand.source) {
             try out.print(
                 "skip {s}/{s}: incompatible sample sources ({t} vs {t})\n",
@@ -414,17 +482,17 @@ fn gateAll(
         }
         const limit = if (cand.durable) durable_limit else in_memory_limit;
         const gate = try evaluate(alloc, base.samples, cand.samples, cand.source != .raw, limit);
-        const enforced = enforcedSources(base.source, cand.source);
-        if (enforced) {
+        const policy = pairPolicy(base, cand, env_mismatch);
+        if (policy.reason == .raw_enforced) {
             gated += 1;
             if (!gate.pass) failures += 1;
         } else {
             report_only += 1;
         }
-        try printGate(out, cand, gate, limit, enforced);
+        try printGate(out, cand.*, gate, limit, policy);
         if (cand.series) |series| {
             series_seen = true;
-            try reportSeries(out, cand, series, lags);
+            try reportSeries(out, cand.*, series, lags);
         }
     }
     for (baseline) |base| {
@@ -432,6 +500,16 @@ fn gateAll(
             try out.print("skip {s}/{s}: not in candidate\n", .{ base.workload, base.mode });
         }
     }
+    return printSummary(out, gated, report_only, failures, series_seen);
+}
+
+fn printSummary(
+    out: *Io.Writer,
+    gated: usize,
+    report_only: usize,
+    failures: usize,
+    series_seen: bool,
+) !u8 {
     if (!series_seen) {
         try out.writeAll("autocorrelation: skipped, no candidate run carries a " ++
             "batch_ns_series array (percentile-only data)\n");
@@ -446,15 +524,46 @@ fn gateAll(
     }
     if (gated == 0) {
         try out.writeAll("bench-gate: nothing enforced; every matched pair is " ++
-            "quantile-only (report-only, exit unaffected)\n");
+            "report-only (exit unaffected)\n");
     }
     return if (failures > 0) exit_fail else exit_ok;
 }
 
-/// Only raw sample vectors on both sides carry a defensible frequentist
-/// interpretation; every other matched pair is report-only.
-fn enforcedSources(base: SampleSource, cand: SampleSource) bool {
-    return base == .raw and cand == .raw;
+const PolicyReason = enum { raw_enforced, summary, few_samples, env_mismatch };
+
+const PairPolicy = struct {
+    reason: PolicyReason,
+    /// Smaller of the two raw sample counts, for the few-samples tag.
+    sample_count: usize = 0,
+};
+
+/// A pair is enforced only when both sides are raw sample vectors of at
+/// least `min_raw_samples` observations recorded in matching
+/// environments; every other pair reports without touching the exit code.
+fn pairPolicy(base: *const Run, cand: *const Run, env_mismatch: bool) PairPolicy {
+    if (base.source != .raw or cand.source != .raw) return .{ .reason = .summary };
+    const count = @min(base.samples.len, cand.samples.len);
+    if (count < min_raw_samples) return .{ .reason = .few_samples, .sample_count = count };
+    if (env_mismatch) return .{ .reason = .env_mismatch };
+    return .{ .reason = .raw_enforced };
+}
+
+const FixtureDiff = struct {
+    name: []const u8,
+    base: f64,
+    cand: f64,
+};
+
+/// First fixture-defining field carried by both records with differing
+/// values; null when the two runs describe the same experiment.
+fn fixtureMismatch(base: *const Run, cand: *const Run) ?FixtureDiff {
+    for (fixture_field_names, base.fixture, cand.fixture) |name, base_slot, cand_slot| {
+        const base_value = base_slot orelse continue;
+        const cand_value = cand_slot orelse continue;
+        if (base_value == cand_value) continue;
+        return .{ .name = name, .base = base_value, .cand = cand_value };
+    }
+    return null;
 }
 
 fn findRun(runs: []const Run, workload: []const u8, mode: []const u8) ?*const Run {
@@ -468,17 +577,31 @@ fn findRun(runs: []const Run, workload: []const u8, mode: []const u8) ?*const Ru
     return null;
 }
 
-fn printGate(out: *Io.Writer, run_record: Run, gate: Gate, limit: f64, enforced: bool) !void {
+fn printGate(
+    out: *Io.Writer,
+    run_record: Run,
+    gate: Gate,
+    limit: f64,
+    policy: PairPolicy,
+) !void {
+    const enforced = policy.reason == .raw_enforced;
     const status = if (!enforced)
         "report-only"
     else if (gate.pass)
         "pass"
     else
         "FAIL";
-    const detail = if (enforced)
-        "raw samples"
-    else
-        "report-only: summary quantiles, not a sample";
+    var detail_buffer: [64]u8 = undefined;
+    const detail: []const u8 = switch (policy.reason) {
+        .raw_enforced => "raw samples",
+        .summary => "report-only: summary quantiles, not a sample",
+        .few_samples => try std.fmt.bufPrint(
+            &detail_buffer,
+            "report-only: insufficient samples ({d} < {d})",
+            .{ policy.sample_count, min_raw_samples },
+        ),
+        .env_mismatch => "report-only: environment mismatch",
+    };
     const over_note = if (!enforced and !gate.pass)
         " (bound over limit; not enforced)"
     else
@@ -716,17 +839,27 @@ fn testRun(source: SampleSource, samples: []f64) Run {
         .series = null,
         .values = 0,
         .wraps = 0,
+        .fixture = @splat(null),
     };
 }
 
 /// Runs the whole gate policy over in-memory Run records, discarding the
 /// report text and returning only the exit code.
-fn testGateAll(base_runs: []const Run, cand_runs: []const Run) !u8 {
+fn testGateAll(base_runs: []const Run, cand_runs: []const Run, env_mismatch: bool) !u8 {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var buffer: [8192]u8 = undefined;
     var writer = Io.Writer.fixed(&buffer);
-    return gateAll(arena.allocator(), base_runs, cand_runs, .{}, &writer);
+    return gateAll(arena.allocator(), base_runs, cand_runs, .{}, env_mismatch, &writer);
+}
+
+/// Fills a baseline vector and a candidate vector regressed by the given
+/// factor over the same deterministic spread.
+fn fillRegression(base: []f64, cand: []f64, factor: f64) void {
+    for (base, cand, 0..) |*baseline_sample, *candidate_sample, index| {
+        baseline_sample.* = 100 + @as(f64, @floatFromInt((index * 7) % 13));
+        candidate_sample.* = baseline_sample.* * factor;
+    }
 }
 
 test "identical raw distributions pass the gate" {
