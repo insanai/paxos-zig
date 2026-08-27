@@ -37,6 +37,21 @@ fn jsonSamples(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
     return writer.buffered();
 }
 
+/// Formats the whole time-ordered `ns` array, each entry divided by
+/// `per`, as a JSON integer array. Feeds the additive `batch_ns_series`
+/// results field that the periodicity check in tools/bench-gate.zig
+/// reads; older result files simply lack it and keep parsing everywhere.
+fn jsonSeries(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    try writer.writeByte('[');
+    for (ns, 0..) |nanoseconds, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{nanoseconds / per});
+    }
+    try writer.writeByte(']');
+    return writer.buffered();
+}
+
 const Mode = struct {
     name: []const u8,
     /// Proposals issued before draining the network once.
@@ -127,6 +142,9 @@ fn MovingBench(
             released: [node_count]u64,
             delivered: [node_count]u64,
             batch_ns: [batch_count]u64,
+            /// Holds the full per-batch series as JSON; sized for the
+            /// widest possible u64 entry plus its separator.
+            series_buffer: [21 * batch_count + 2]u8,
         };
 
         var state: State = undefined;
@@ -138,10 +156,12 @@ fn MovingBench(
             const median = totals[moving_samples / 2];
 
             const s = &state;
-            // Stride the time-ordered per-batch measurements before the
-            // sort below turns them into order statistics.
+            // Serialize the full time-ordered series and its strided
+            // sample subset before the sort below turns the per-batch
+            // measurements into order statistics.
             var sample_buffer: [2048]u8 = undefined;
             const samples_json = try jsonSamples(&sample_buffer, &s.batch_ns, batch);
+            const series_json = try jsonSeries(&s.series_buffer, &s.batch_ns, batch);
             std.mem.sort(u64, &s.batch_ns, {}, std.sort.asc(u64));
             const per_batch = [4]u64{
                 s.batch_ns[batch_count / 2],
@@ -175,7 +195,7 @@ fn MovingBench(
                     "\"ns_total_median\":{d},\"ns_per_value\":{d:.2}," ++
                     "\"batch_ns_per_value_p50\":{d},\"batch_ns_per_value_p90\":{d}," ++
                     "\"batch_ns_per_value_p99\":{d},\"batch_ns_per_value_max\":{d}," ++
-                    "\"samples_ns_per_value\":{s}}}\n",
+                    "\"samples_ns_per_value\":{s},\"batch_ns_series\":{s}}}\n",
                 .{
                     workload,             batch,
                     total,                node_count,
@@ -183,7 +203,7 @@ fn MovingBench(
                     median,               ns_per_value,
                     per_batch[0] / batch, per_batch[1] / batch,
                     per_batch[2] / batch, per_batch[3] / batch,
-                    samples_json,
+                    samples_json,         series_json,
                 },
             );
             return 0;

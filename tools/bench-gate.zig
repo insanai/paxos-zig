@@ -267,10 +267,10 @@ fn warnEnvironment(base: Meta, cand: Meta, out: *Io.Writer) !bool {
 /// max_slots, the moving run window_slots and wraps, durable runs
 /// neither), so only fields present on both sides are compared.
 const fixture_field_names = [_][]const u8{
-    "values",       "nodes",
-    "payload_bytes", "values_per_iteration",
+    "values",                 "nodes",
+    "payload_bytes",          "values_per_iteration",
     "measurement_iterations", "max_slots",
-    "window_slots",  "wraps",
+    "window_slots",           "wraps",
 };
 
 const Run = struct {
@@ -916,19 +916,16 @@ test "identical raw samples pass the whole gate" {
     var same = base;
     var base_runs = [_]Run{testRun(.raw, &base)};
     var cand_runs = [_]Run{testRun(.raw, &same)};
-    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs));
+    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, false));
 }
 
 test "a raw-sample regression fails the whole gate" {
     var base: [64]f64 = undefined;
     var cand: [64]f64 = undefined;
-    for (&base, &cand, 0..) |*baseline_sample, *candidate_sample, index| {
-        baseline_sample.* = 100 + @as(f64, @floatFromInt((index * 7) % 13));
-        candidate_sample.* = baseline_sample.* * 1.10;
-    }
+    fillRegression(&base, &cand, 1.10);
     var base_runs = [_]Run{testRun(.raw, &base)};
     var cand_runs = [_]Run{testRun(.raw, &cand)};
-    try std.testing.expectEqual(exit_fail, try testGateAll(&base_runs, &cand_runs));
+    try std.testing.expectEqual(exit_fail, try testGateAll(&base_runs, &cand_runs, false));
 }
 
 test "a quantile-only regression is report-only and never fails the gate" {
@@ -937,10 +934,65 @@ test "a quantile-only regression is report-only and never fails the gate" {
     for (&shifted, base) |*candidate_sample, baseline_sample| {
         candidate_sample.* = baseline_sample * 1.10;
     }
-    try std.testing.expect(!enforcedSources(.batch_quantiles, .batch_quantiles));
-    var base_runs = [_]Run{testRun(.batch_quantiles, &base)};
-    var cand_runs = [_]Run{testRun(.batch_quantiles, &shifted)};
-    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs));
+    const base_run = testRun(.batch_quantiles, &base);
+    const cand_run = testRun(.batch_quantiles, &shifted);
+    try std.testing.expectEqual(
+        PolicyReason.summary,
+        pairPolicy(&base_run, &cand_run, false).reason,
+    );
+    var base_runs = [_]Run{base_run};
+    var cand_runs = [_]Run{cand_run};
+    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, false));
+}
+
+test "a raw pair below 32 samples is report-only and never fails the gate" {
+    var base: [16]f64 = undefined;
+    var cand: [16]f64 = undefined;
+    fillRegression(&base, &cand, 1.10);
+    const base_run = testRun(.raw, &base);
+    const cand_run = testRun(.raw, &cand);
+    const policy = pairPolicy(&base_run, &cand_run, false);
+    try std.testing.expectEqual(PolicyReason.few_samples, policy.reason);
+    try std.testing.expectEqual(@as(usize, 16), policy.sample_count);
+    var base_runs = [_]Run{base_run};
+    var cand_runs = [_]Run{cand_run};
+    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, false));
+}
+
+test "an environment mismatch downgrades a raw regression to report-only" {
+    var base: [64]f64 = undefined;
+    var cand: [64]f64 = undefined;
+    fillRegression(&base, &cand, 1.10);
+    var base_runs = [_]Run{testRun(.raw, &base)};
+    var cand_runs = [_]Run{testRun(.raw, &cand)};
+    try std.testing.expectEqual(exit_fail, try testGateAll(&base_runs, &cand_runs, false));
+    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, true));
+}
+
+test "a fixture mismatch skips the pair instead of comparing it" {
+    var base: [64]f64 = undefined;
+    var cand: [64]f64 = undefined;
+    fillRegression(&base, &cand, 1.10);
+    // The regressed pair differs on the first fixture field ("values"),
+    // so the gate must skip it rather than fail on it; a clean matching
+    // pair keeps the files comparable.
+    var mismatched_base = testRun(.raw, &base);
+    mismatched_base.fixture[0] = 4096;
+    var mismatched_cand = testRun(.raw, &cand);
+    mismatched_cand.fixture[0] = 8192;
+    try std.testing.expect(fixtureMismatch(&mismatched_base, &mismatched_cand) != null);
+
+    var same = base;
+    var clean_base = testRun(.raw, &base);
+    clean_base.workload = "u64-3n";
+    var clean_cand = testRun(.raw, &same);
+    clean_cand.workload = "u64-3n";
+    // A field carried by only one side never blocks the pair.
+    try std.testing.expect(fixtureMismatch(&mismatched_base, &clean_cand) == null);
+
+    var base_runs = [_]Run{ mismatched_base, clean_base };
+    var cand_runs = [_]Run{ mismatched_cand, clean_cand };
+    try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, false));
 }
 
 test "autocorrelation flags an injected periodic series" {
