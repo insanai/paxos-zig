@@ -633,6 +633,47 @@ pub fn ProtocolGated(
                 return null;
             }
 
+            /// Folds one record of a lifetime journal, oldest first.
+            /// Unlike `apply`, the fold spans configuration changes and
+            /// window reuse (ZDS 0008 over ZDS 0011): a promise or accept
+            /// below an earlier ballot line is history, not a regression —
+            /// the maximum promise is kept so the acceptor can never
+            /// promise backwards — and an accept whose cell was reused by
+            /// a newer slot is stale (its own slot was already chosen, or
+            /// the newer claim could not have happened) and is skipped.
+            pub fn replayFold(self: *DurableState, write: Write) !void {
+                self.assertValid();
+                switch (write) {
+                    .promise => |ballot| {
+                        if (self.promised.lessThan(ballot)) self.promised = ballot;
+                    },
+                    .accept => |accepted| {
+                        if (accepted.slot == 0) return error.InvalidSlot;
+                        const cell = self.claim(accepted.slot) orelse {
+                            const held = &self.cells[cellIndex(accepted.slot)];
+                            if (held.slot > accepted.slot) return;
+                            return error.WindowOverrun;
+                        };
+                        if (cell.accepted) |stored| {
+                            if (stored.ballot.eql(accepted.ballot) and
+                                !std.meta.eql(stored.value, accepted.value))
+                            {
+                                return error.ConflictingValue;
+                            }
+                        }
+                        if (self.promised.lessThan(accepted.ballot)) {
+                            self.promised = accepted.ballot;
+                        }
+                        cell.accepted = .{
+                            .ballot = accepted.ballot,
+                            .value = accepted.value,
+                        };
+                    },
+                    .commit, .trim_anchor => try self.apply(write),
+                }
+                self.assertValid();
+            }
+
             /// Replays one journal record in original write order. Regressed
             /// promises and conflicting values are reported as errors, not
             /// repaired: a journal that violates durable monotonicity is
