@@ -660,7 +660,7 @@ test "paired quantile summaries gate identically and on shift" {
 test "autocorrelation flags an injected periodic series" {
     var series: [256]f64 = undefined;
     for (&series, 0..) |*value, index| {
-        value.* = 100 + @as(f64, @floatFromInt(if (index % 16 == 0) 50 else 0));
+        value.* = if (index % 16 == 0) 150 else 100;
     }
     try std.testing.expect(autocorrelation(&series, 16) > autocorrelation_flag);
     try std.testing.expect(@abs(autocorrelation(&series, 7)) < autocorrelation_flag);
