@@ -832,6 +832,27 @@ pub fn ProtocolGated(
             /// there, so a replayed window whose early cells were reused
             /// stays deliverable. `decidedThrough()` reports `floor` until
             /// commits above it re-release the suffix.
+            /// Starts an empty node whose window resumes at `floor` on
+            /// the same global slot line, carrying an inherited trim
+            /// anchor. Used to continue across a decided configuration
+            /// change without journal replay (ZDS 0011, ZDS 0008).
+            pub fn continueAt(
+                self: *Node,
+                id: NodeId,
+                membership: *const Membership,
+                anchor: TrimAnchor,
+                floor: Slot,
+                leader_priority: u32,
+            ) !void {
+                if (anchor.chosen_trim_slot > floor) return error.TrimRegression;
+                try self.initWithPriority(id, membership, leader_priority);
+                self.durable.anchor = anchor;
+                self.memory_floor = floor;
+                self.delivered_through = floor;
+                self.next_slot = floor + 1;
+                self.assertValid();
+            }
+
             pub fn restoreAt(
                 self: *Node,
                 id: NodeId,

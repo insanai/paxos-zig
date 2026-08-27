@@ -272,21 +272,52 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 self.observeDurable();
             }
 
-            /// Starts the configuration named by a decided stop sign.
+            /// Starts the configuration named by a decided stop sign,
+            /// continuing the same global slot line at `stop_slot` with
+            /// the inherited trim anchor (ZDS 0011).
             pub fn initFromStop(
                 self: *Node,
                 id: protocol.NodeId,
                 stop: *const StopSign,
+                stop_slot: protocol.Slot,
+                anchor: TrimAnchor,
                 membership: *Membership,
                 leader_priority: u32,
             ) !void {
                 try membership.init(stop.membersSlice());
-                try self.initWithPriority(
+                try self.continueAt(
                     id,
                     stop.configuration_id,
                     membership,
+                    anchor,
+                    stop_slot,
                     leader_priority,
                 );
+            }
+
+            /// Starts an empty node at `floor` on the same global slot
+            /// line under an explicit configuration and membership.
+            pub fn continueAt(
+                self: *Node,
+                id: protocol.NodeId,
+                configuration_id: u64,
+                membership: *const Membership,
+                anchor: TrimAnchor,
+                floor: protocol.Slot,
+                leader_priority: u32,
+            ) !void {
+                if (configuration_id == 0) return error.InvalidConfigurationId;
+                try self.core.continueAt(
+                    id,
+                    membership,
+                    anchor,
+                    floor,
+                    leader_priority,
+                );
+                self.configuration_id = configuration_id;
+                self.stop_sign = null;
+                self.stop_slot = 0;
+                self.stop_pending = false;
             }
 
             /// Campaigns using an application command that acts as a no-op.
@@ -597,16 +628,18 @@ test "a decided stop sign starts a changed-member configuration" {
     // A surviving or fresh member starts the next configuration.
     var next_membership: Log.Membership = undefined;
     var next: Log.Node = undefined;
-    try next.initFromStop(4, stop, &next_membership, 0);
+    try next.initFromStop(4, stop, seal_slot, .{}, &next_membership, 0);
     try std.testing.expectEqual(@as(u64, 8), next.configurationId());
     try std.testing.expectEqual(@as(?protocol.Slot, null), next.stopSlot());
+    // The next configuration continues the same global slot line.
+    try std.testing.expectEqual(seal_slot, next.decidedThrough());
 
     // The departed member cannot join the configuration that removed it.
     var removed_membership: Log.Membership = undefined;
     var removed: Log.Node = undefined;
     try std.testing.expectError(
         error.NotMember,
-        removed.initFromStop(1, stop, &removed_membership, 0),
+        removed.initFromStop(1, stop, seal_slot, .{}, &removed_membership, 0),
     );
 }
 
@@ -699,11 +732,11 @@ test "reconfigure seals an epoch and initializes the next one" {
     first.core.ballot = .{ .round = 1, .node = 1 };
     var effects = Log.Effects{};
 
-    _ = try first.reconfigure(12, &.{1}, "state:3", &effects);
+    const seal_slot = try first.reconfigure(12, &.{1}, "state:3", &effects);
     const stop = first.isReconfigured().?;
     var next_membership: Log.Membership = undefined;
     var next: Log.Node = undefined;
-    try next.initFromStop(1, &stop, &next_membership, 9);
+    try next.initFromStop(1, &stop, seal_slot, .{}, &next_membership, 9);
     try std.testing.expectEqual(@as(u64, 12), next.configurationId());
     try std.testing.expectEqual(@as(u32, 9), next.core.leader_priority);
 }

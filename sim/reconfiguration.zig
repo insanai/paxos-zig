@@ -53,6 +53,8 @@ const Cluster = struct {
     journals: [node_count]Journal,
     network: [network_capacity]Log.Envelope,
     network_count: usize,
+    /// Global slot the current epoch continues from (0 for the first).
+    epoch_base: paxos.Slot = 0,
 
     fn init(
         self: *Cluster,
@@ -62,6 +64,7 @@ const Cluster = struct {
     ) !void {
         self.seed = seed;
         self.prng = std.Random.DefaultPrng.init(seed);
+        self.epoch_base = 0;
         self.ids = ids;
         try self.membership.init(&self.ids);
         for (0..node_count) |index| {
@@ -72,17 +75,31 @@ const Cluster = struct {
         self.network_count = 0;
     }
 
-    /// Starts the next epoch named by a decided stop sign.
-    fn initFromStop(self: *Cluster, seed: u64, stop: *const Log.StopSign) !void {
+    /// Starts the next epoch named by a decided stop sign, continuing
+    /// the global slot line at the decided stop slot (ZDS 0011).
+    fn initFromStop(
+        self: *Cluster,
+        seed: u64,
+        stop: *const Log.StopSign,
+        stop_slot: paxos.Slot,
+    ) !void {
         self.seed = seed;
         self.prng = std.Random.DefaultPrng.init(seed);
+        self.epoch_base = stop_slot;
         const members = stop.membersSlice();
         if (members.len != node_count) {
             return self.fail("stop sign names {d} members; harness expects 3", .{members.len});
         }
         for (0..node_count) |index| self.ids[index] = members[index];
         for (0..node_count) |index| {
-            try self.nodes[index].initFromStop(self.ids[index], stop, &self.membership, 0);
+            try self.nodes[index].initFromStop(
+                self.ids[index],
+                stop,
+                stop_slot,
+                .{},
+                &self.membership,
+                0,
+            );
             self.effects[index].init();
             self.journals[index].count = 0;
         }
@@ -368,14 +385,15 @@ const Cluster = struct {
             if (node.configurationId() != configuration_id) {
                 return self.fail("node {d} runs the wrong configuration", .{self.ids[index]});
             }
-            if (node.decidedThrough() < values.len) {
+            if (node.decidedThrough() < self.epoch_base + values.len) {
                 return self.fail("node {d} decided only {d} new-epoch entries", .{
                     self.ids[index],
-                    node.decidedThrough(),
+                    node.decidedThrough() -| self.epoch_base,
                 });
             }
-            for (values, 1..) |value, slot| {
-                const entry = node.read(@intCast(slot)) orelse {
+            for (values, 1..) |value, offset| {
+                const slot = self.epoch_base + offset;
+                const entry = node.read(slot) orelse {
                     return self.fail("node {d} is missing new-epoch slot {d}", .{
                         self.ids[index],
                         slot,
@@ -455,7 +473,7 @@ fn runSealRaceScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u64) !void
     // Epoch handover: the stop sign names the next configuration, which
     // elects its own leader and decides fresh entries.
     const stop = cluster.nodes[0].isReconfigured().?;
-    try next_epoch.initFromStop(seed, &stop);
+    try next_epoch.initFromStop(seed, &stop, seal_slot);
     try next_epoch.elect(1);
     _ = try next_epoch.appendAt(1, 201);
     _ = try next_epoch.appendAt(1, 202);
@@ -491,7 +509,7 @@ fn runMembershipChangeScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u6
     // The departing node 1 stays sealed while nodes 2, 3, and 4 start the
     // new configuration and decide without it.
     const stop = cluster.nodes[0].isReconfigured().?;
-    try next_epoch.initFromStop(seed, &stop);
+    try next_epoch.initFromStop(seed, &stop, seal_slot);
     try next_epoch.elect(1);
     _ = try next_epoch.appendAt(1, 21);
     try next_epoch.drainShuffled();
@@ -548,7 +566,7 @@ fn runVoterReplacementScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u6
     // join attempt is rejected at initialization.
     var removed_membership: Log.Membership = undefined;
     var removed: Log.Node = undefined;
-    if (removed.initFromStop(3, &stop, &removed_membership, 0)) |_| {
+    if (removed.initFromStop(3, &stop, seal_slot, .{}, &removed_membership, 0)) |_| {
         return cluster.fail("removed voter joined the next configuration", .{});
     } else |err| if (err != error.NotMember) {
         return cluster.fail("removed voter join returned {t}", .{err});
@@ -556,7 +574,7 @@ fn runVoterReplacementScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u6
 
     // Survivors 1 and 2 plus fresh voter 4 elect a leader (varying by seed)
     // and decide without the removed voter.
-    try next_epoch.initFromStop(seed, &stop);
+    try next_epoch.initFromStop(seed, &stop, seal_slot);
     const next_leader: usize = @intCast((seed / node_count) % node_count);
     try next_epoch.elect(next_leader);
     _ = try next_epoch.appendAt(next_leader, 41);
