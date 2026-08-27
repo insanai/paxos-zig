@@ -397,6 +397,7 @@ fn gateAll(
     out: *Io.Writer,
 ) !u8 {
     var gated: usize = 0;
+    var report_only: usize = 0;
     var failures: usize = 0;
     var series_seen = false;
     for (candidate) |cand| {
@@ -413,9 +414,14 @@ fn gateAll(
         }
         const limit = if (cand.durable) durable_limit else in_memory_limit;
         const gate = try evaluate(alloc, base.samples, cand.samples, cand.source != .raw, limit);
-        gated += 1;
-        if (!gate.pass) failures += 1;
-        try printGate(out, cand, gate, limit);
+        const enforced = enforcedSources(base.source, cand.source);
+        if (enforced) {
+            gated += 1;
+            if (!gate.pass) failures += 1;
+        } else {
+            report_only += 1;
+        }
+        try printGate(out, cand, gate, limit, enforced);
         if (cand.series) |series| {
             series_seen = true;
             try reportSeries(out, cand, series, lags);
@@ -430,12 +436,25 @@ fn gateAll(
         try out.writeAll("autocorrelation: skipped, no candidate run carries a " ++
             "batch_ns_series array (percentile-only data)\n");
     }
-    try out.print("bench-gate: {d} runs gated, {d} regressions\n", .{ gated, failures });
-    if (gated == 0) {
+    try out.print(
+        "bench-gate: {d} raw-sample runs gated, {d} regressions, {d} report-only\n",
+        .{ gated, failures, report_only },
+    );
+    if (gated == 0 and report_only == 0) {
         try out.writeAll("bench-gate: no comparable runs; failing\n");
         return exit_fail;
     }
+    if (gated == 0) {
+        try out.writeAll("bench-gate: nothing enforced; every matched pair is " ++
+            "quantile-only (report-only, exit unaffected)\n");
+    }
     return if (failures > 0) exit_fail else exit_ok;
+}
+
+/// Only raw sample vectors on both sides carry a defensible frequentist
+/// interpretation; every other matched pair is report-only.
+fn enforcedSources(base: SampleSource, cand: SampleSource) bool {
+    return base == .raw and cand == .raw;
 }
 
 fn findRun(runs: []const Run, workload: []const u8, mode: []const u8) ?*const Run {
