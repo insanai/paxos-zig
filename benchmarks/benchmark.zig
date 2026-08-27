@@ -16,6 +16,27 @@ const paxos = @import("paxos");
 
 const sample_count = 7;
 
+/// Cap on raw samples recorded per run: enough for the statistical gate
+/// to work on a real sample vector while keeping result rows compact.
+const max_recorded_samples = 64;
+
+/// Formats at most `max_recorded_samples` evenly-strided entries of the
+/// time-ordered `ns` array, each divided by `per`, as a JSON integer
+/// array. Feeds the additive `samples_ns_per_value` results field; older
+/// result files simply lack it and keep parsing everywhere.
+fn jsonSamples(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    const stride = (ns.len + max_recorded_samples - 1) / max_recorded_samples;
+    try writer.writeByte('[');
+    var index: usize = 0;
+    while (index < ns.len) : (index += stride) {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{ns[index] / per});
+    }
+    try writer.writeByte(']');
+    return writer.buffered();
+}
+
 const Mode = struct {
     name: []const u8,
     /// Proposals issued before draining the network once.
@@ -117,6 +138,10 @@ fn MovingBench(
             const median = totals[moving_samples / 2];
 
             const s = &state;
+            // Stride the time-ordered per-batch measurements before the
+            // sort below turns them into order statistics.
+            var sample_buffer: [2048]u8 = undefined;
+            const samples_json = try jsonSamples(&sample_buffer, &s.batch_ns, batch);
             std.mem.sort(u64, &s.batch_ns, {}, std.sort.asc(u64));
             const per_batch = [4]u64{
                 s.batch_ns[batch_count / 2],
@@ -149,7 +174,8 @@ fn MovingBench(
                     "\"payload_bytes\":8,\"window_slots\":{d},\"wraps\":{d}," ++
                     "\"ns_total_median\":{d},\"ns_per_value\":{d:.2}," ++
                     "\"batch_ns_per_value_p50\":{d},\"batch_ns_per_value_p90\":{d}," ++
-                    "\"batch_ns_per_value_p99\":{d},\"batch_ns_per_value_max\":{d}}}\n",
+                    "\"batch_ns_per_value_p99\":{d},\"batch_ns_per_value_max\":{d}," ++
+                    "\"samples_ns_per_value\":{s}}}\n",
                 .{
                     workload,             batch,
                     total,                node_count,
@@ -157,6 +183,7 @@ fn MovingBench(
                     median,               ns_per_value,
                     per_batch[0] / batch, per_batch[1] / batch,
                     per_batch[2] / batch, per_batch[3] / batch,
+                    samples_json,
                 },
             );
             return 0;
@@ -331,9 +358,17 @@ fn Bench(
             const median = samples[sample_count / 2];
 
             _ = try runSample(io, mode, true);
+            // Stride the time-ordered window measurements before the
+            // percentile pass sorts them into order statistics.
+            var sample_buffer: [2048]u8 = undefined;
+            const samples_json = try jsonSamples(
+                &sample_buffer,
+                state.window_ns[0..state.window_count],
+                1,
+            );
             var window_ns_per_value: [4]u64 = .{ 0, 0, 0, 0 };
             computePercentiles(&window_ns_per_value);
-            report(workload, mode, &samples, median, window_ns_per_value);
+            report(workload, mode, &samples, median, window_ns_per_value, samples_json);
 
             const expected_checksum = value_count * (value_count + 1) / 2 *
                 measurement_iterations;
@@ -494,6 +529,7 @@ fn Bench(
             samples: *const [sample_count]Sample,
             median: Sample,
             window_ns_per_value: [4]u64,
+            samples_json: []const u8,
         ) void {
             const measured_values = value_count * measurement_iterations;
             const per_value = @as(f64, @floatFromInt(median.nanoseconds)) /
@@ -533,7 +569,8 @@ fn Bench(
                     "\"window_ns_per_value_p90\":{d}," ++
                     "\"window_ns_per_value_p99\":{d}," ++
                     "\"window_ns_per_value_max\":{d}," ++
-                    "\"messages\":{d},\"checksum\":{d}}}\n\n",
+                    "\"messages\":{d},\"checksum\":{d}," ++
+                    "\"samples_ns_per_value\":{s}}}\n\n",
                 .{
                     workload,                              mode.name,
                     measured_values,                       node_count,
@@ -544,6 +581,7 @@ fn Bench(
                     window_ns_per_value[0],                window_ns_per_value[1],
                     window_ns_per_value[2],                window_ns_per_value[3],
                     median.messages,                       median.checksum,
+                    samples_json,
                 },
             );
         }

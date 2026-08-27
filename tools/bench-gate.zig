@@ -2,25 +2,35 @@
 //! (ZDS 0011 performance gates).
 //!
 //! Compares a baseline and a candidate results file (the JSON emitted into
-//! benchmarks/results/) and exits nonzero when any matched paxos-zig run
+//! benchmarks/results/) and exits nonzero only when a matched paxos-zig
+//! run whose records BOTH carry a raw `samples_ns_per_value` array
 //! regresses. Per workload/mode pair the Hodges-Lehmann shift between the
-//! two sample vectors is estimated with a bootstrap 95% confidence interval
-//! under a fixed PRNG seed, so repeated invocations reproduce the same
-//! interval bit for bit. The gate fails when the interval's upper bound
-//! exceeds +3% of the baseline median for in-memory workloads or +5% for
-//! durable workloads.
+//! two sample vectors is estimated with a percentile-bootstrap 95%
+//! confidence interval under a fixed PRNG seed, so repeated invocations
+//! reproduce the same interval bit for bit. (The verification plan asks
+//! for a bootstrap interval; the plain percentile bootstrap satisfies it
+//! and BCa correction is deliberately not required.) An enforced pair
+//! fails when the interval's upper bound exceeds +3% of the baseline
+//! median for in-memory workloads or +5% for durable workloads.
 //!
-//! The recorded protocol stores summary statistics, not raw samples. Absent
-//! an optional raw `samples_ns_per_value` array, the per-value summary set
-//! stands in as the sample vector: the window or batch p50/p90/p99/max
-//! quantiles, or min/median/max of `ns_total` normalized per value for
-//! durable runs. Quantile summaries are order statistics, so the two-sample
-//! pairwise-difference form of Hodges-Lehmann would let one heavy `max`
-//! dominate; matched summaries are therefore paired positionally and the
-//! shift is the one-sample Hodges-Lehmann estimator (median of Walsh
-//! averages) over the per-quantile differences, bootstrapped by resampling
-//! those differences. Raw sample arrays use the two-sample form (median of
-//! all pairwise differences) with independent resampling of each side.
+//! Runs recorded before the raw field existed expose only summary
+//! statistics: the window or batch p50/p90/p99/max quantiles, or
+//! min/median/max of `ns_total` normalized per value for durable runs. A
+//! four-point quantile grid is not a sample with a defensible frequentist
+//! interpretation, so such pairs are REPORT-ONLY: they are compared and
+//! printed as "report-only: summary quantiles, not a sample" but never
+//! affect the exit code. Quantile summaries are order statistics, so the
+//! two-sample pairwise-difference form of Hodges-Lehmann would let one
+//! heavy `max` dominate; matched summaries are therefore paired
+//! positionally and the shift is the one-sample Hodges-Lehmann estimator
+//! (median of Walsh averages) over the per-quantile differences,
+//! bootstrapped by resampling those differences. Raw sample arrays use
+//! the two-sample form (median of all pairwise differences) with
+//! independent resampling of each side.
+//!
+//! When both files record environment metadata (meta host, cpu, os, zig)
+//! any difference is printed as a prominent warning — cross-environment
+//! shifts are not attributable to the code — but never fails the gate.
 //!
 //! The periodicity check needs the candidate's per-batch series (optional
 //! `batch_ns_series` array). The recorded protocol is percentile-only
@@ -48,8 +58,15 @@ const usage_text =
     \\Runs lacking every source are ignored. The gate is the bootstrap 95%
     \\upper confidence bound of the Hodges-Lehmann shift: it must stay at
     \\or below +3% of the baseline median, or +5% for workloads whose name
-    \\starts with "durable". Quantile summaries are gated as paired
-    \\per-quantile differences; raw arrays as all pairwise differences.
+    \\starts with "durable". Only pairs where BOTH runs carry the raw
+    \\samples_ns_per_value array are enforced (exit 1 on regression).
+    \\Pairs matched through summary quantiles are printed as
+    \\"report-only: summary quantiles, not a sample" and never affect the
+    \\exit code. Quantile summaries are compared as paired per-quantile
+    \\differences; raw arrays as all pairwise differences.
+    \\
+    \\When both files carry meta host/tool fields (host, cpu, os, zig), a
+    \\mismatch prints a prominent warning without failing the gate.
     \\
     \\The autocorrelation check reads an optional per-batch
     \\"batch_ns_series" array from candidate runs; --wrap-lag and
@@ -142,10 +159,11 @@ fn run(
     const baseline = try loadRuns(alloc, io, baseline_path, err_out);
     const candidate = try loadRuns(alloc, io, candidate_path, err_out);
     try out.print(
-        "bench-gate: baseline {s} ({d} gated runs), candidate {s} ({d} gated runs)\n",
-        .{ baseline_path, baseline.len, candidate_path, candidate.len },
+        "bench-gate: baseline {s} ({d} comparable runs), candidate {s} ({d} comparable runs)\n",
+        .{ baseline_path, baseline.runs.len, candidate_path, candidate.runs.len },
     );
-    return gateAll(alloc, baseline, candidate, lags, out);
+    try warnEnvironment(baseline.meta, candidate.meta, out);
+    return gateAll(alloc, baseline.runs, candidate.runs, lags, out);
 }
 
 fn lagValue(iterator: *std.process.Args.Iterator, err_out: *Io.Writer) !?usize {
