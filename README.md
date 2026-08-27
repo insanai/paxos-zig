@@ -56,8 +56,9 @@ build the library this way.
 - Zig 0.16. Zero dependencies. No allocator; all memory is bounded up front.
 - Tolerates crash/restart, message loss, duplication, delay, and reordering.
 - Assumes non-Byzantine nodes and quorum intersection.
-- A sealed, reconfigurable replicated-log layer with stop-sign membership
-  changes and snapshot epochs.
+- A reconfigurable replicated-log layer: 64-bit global slots that never
+  reset, a fixed consensus window with host-licensed reuse, certified log
+  trimming, and stop-sign membership changes on one slot line.
 
 ## Getting it
 
@@ -112,7 +113,7 @@ const Command = struct {
 
 const P = paxos.Protocol(Command, .{
     .max_members = 5,
-    .max_slots = 4096,
+    .window_slots = 4096,
     .read_quorum_size = 3,
     .write_quorum_size = 3,
 });
@@ -144,10 +145,10 @@ Feed network input with `node.step(envelope, &effects)`. Once `node.role` is
 `node.tick(noop_command, &effects)` at a steady interval; ticks drive
 elections, heartbeats, and retransmission. No wall clock is ever read.
 
-For membership changes and snapshot epochs, use
-`paxos.ReplicatedLog(Command, options)`. Its `reconfigure` seals the old
-configuration with an ordered stop sign, `checkpoint` seals an epoch with
-snapshot metadata, and `initFromStop` starts the next configuration.
+For membership changes, use `paxos.ReplicatedLog(Command, options)`. Its
+`reconfigure` seals the old configuration with an ordered stop sign, and
+`initFromStop` continues the next configuration at the decided stop slot
+on the same global slot line.
 
 Hosts that batch several transitions behind one shared storage barrier can
 declare their protocol through `paxos.host_managed.Protocol` instead. That
@@ -263,8 +264,10 @@ source conventions are explained there in the reviewable-code chapter.
 
 - A `Protocol.Node` has fixed membership. `ReplicatedLog.Node` changes
   membership by deciding a stop sign and starting a new configuration.
-- Storage is bounded by `max_slots`. Snapshot and start a new epoch before
-  the bound is reached.
+- Memory is bounded by `window_slots`. Slots are global and never reset;
+  the host licenses window reuse by advancing the memory floor as it
+  consumes and journals decided values, and a full window is transient
+  backpressure (`error.WindowFull`), not exhaustion.
 - `committedSlice()` releases a contiguous prefix during live transitions; it
   is not a recovery feed. Persist the applied slot with your state machine
   and replay missing values explicitly.
