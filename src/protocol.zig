@@ -714,6 +714,15 @@ pub fn ProtocolGated(
                         {
                             return error.TrimRegression;
                         }
+                        // A trim id names one chosen record; a replayed
+                        // twin with different content is corruption, the
+                        // same rule `trim.classify` applies on adoption.
+                        if (anchor.trim_id == self.anchor.trim_id and
+                            self.anchor.trim_id != 0 and
+                            !std.meta.eql(anchor, self.anchor))
+                        {
+                            return error.TrimRegression;
+                        }
                         self.anchor = anchor;
                     },
                     .commit => |committed| {
@@ -907,6 +916,18 @@ pub fn ProtocolGated(
                 // A replayed trim anchor implies the prefix through it is
                 // chosen and released; the floor never sits below it.
                 const base = @max(floor, self.durable.anchor.chosen_trim_slot);
+                // A vote at or below the base is discharged history: the
+                // slot sits inside the consumed or anchored chosen prefix
+                // that this node's `chosen_through` fences, so the open
+                // obligation the vote carried no longer protects anything.
+                // An accepted-only occupant left behind would wedge its
+                // cell forever, because accepted-only cells are never
+                // evicted; a committed occupant stays and retags on
+                // demand.
+                for (&self.durable.cells) |*cell| {
+                    if (cell.slot == 0 or cell.slot > base) continue;
+                    if (cell.committed == null) cell.* = .{};
+                }
                 self.memory_floor = base;
                 self.delivered_through = base;
                 self.next_slot = @max(self.highestUsedSlot(), base) + 1;
@@ -1622,6 +1643,15 @@ pub fn ProtocolGated(
                 effects: *Effects,
             ) !void {
                 if (message.slot == 0) return error.InvalidSlot;
+                // The anchored prefix is closed (GlobalTrim.tla `Vote`
+                // guards `slot > anchor`): every slot at or below the
+                // certified trim anchor is already chosen, so a late
+                // accept there is history. Voting would re-tag a released
+                // cell with an accepted-only occupant that eviction can
+                // never clear.
+                if (message.slot <= self.durable.anchor.chosen_trim_slot) {
+                    return;
+                }
                 if (message.ballot.lessThan(self.durable.promised)) {
                     self.sendNack(from, message.ballot, effects);
                     return;
@@ -1741,8 +1771,12 @@ pub fn ProtocolGated(
                 if (slot == 0) return error.InvalidSlot;
                 // A commit at or below the memory floor is a duplicate for a
                 // slot whose cell was already released: it was chosen and
-                // delivered, so there is nothing left to record.
+                // delivered, so there is nothing left to record. The same
+                // holds at or below the certified trim anchor, which can
+                // run ahead of the floor until the host consumes
+                // (GlobalTrim.tla `Learn` guards `slot > anchor`).
                 if (slot <= self.memory_floor) return;
+                if (slot <= self.durable.anchor.chosen_trim_slot) return;
                 // A commit whose physical cell is owned by another live
                 // slot does not need window residency: at exactly the next
                 // delivery position it passes straight through to the host,
@@ -2540,6 +2574,115 @@ test "a trimmed quorum closes its prefix to a new leader after replay" {
         }
     }
     try std.testing.expect(described);
+}
+
+test "the anchored prefix refuses accepts and commits even above the floor" {
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 8 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    var node: P.Node = undefined;
+    try node.init(2, &membership);
+    var effects = P.Effects{};
+
+    // Deliver six slots, but consume only two: the installed anchor runs
+    // ahead of the memory floor, exactly the gap the guards must cover.
+    var slot: Slot = 1;
+    while (slot <= 6) : (slot += 1) {
+        try node.step(.{ .from = 1, .to = 2, .message = .{
+            .commit = .{ .slot = slot, .value = slot * 10 },
+        } }, &effects);
+        effects.confirmWritesDurable();
+    }
+    try node.advanceMemoryFloor(2);
+    try node.installChosenTrim(.{
+        .trim_id = 1,
+        .chosen_trim_slot = 6,
+        .history_hash = [_]u8{7} ** 32,
+    }, &effects);
+    effects.confirmWritesDurable();
+
+    // An accept inside the anchored prefix is history: no vote, no write,
+    // no reply, whatever its ballot.
+    try node.step(.{ .from = 1, .to = 2, .message = .{ .accept = .{
+        .ballot = .{ .round = 9, .node = 1 },
+        .slot = 4,
+        .value = 999,
+    } } }, &effects);
+    try std.testing.expectEqual(@as(usize, 0), effects.writesSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), effects.messagesSlice().len);
+    try std.testing.expectEqual(@as(u64, 40), node.durable.committedAt(4).?);
+
+    // A duplicate commit there is equally inert.
+    try node.step(.{ .from = 1, .to = 2, .message = .{
+        .commit = .{ .slot = 3, .value = 999 },
+    } }, &effects);
+    try std.testing.expectEqual(@as(usize, 0), effects.writesSlice().len);
+    try std.testing.expectEqual(@as(u64, 30), node.durable.committedAt(3).?);
+
+    // The first slot above the anchor still votes normally.
+    try node.step(.{ .from = 1, .to = 2, .message = .{ .accept = .{
+        .ballot = .{ .round = 9, .node = 1 },
+        .slot = 7,
+        .value = 70,
+    } } }, &effects);
+    try std.testing.expectEqual(@as(usize, 1), effects.writesSlice().len);
+    effects.confirmWritesDurable();
+    try std.testing.expectEqual(@as(u64, 70), node.durable.acceptedAt(7).?.value);
+}
+
+test "restore preserves the promise and votes above the floor, not below" {
+    const P = Protocol(u64, .{ .max_members = 3, .window_slots = 8 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+
+    // A durable state carrying a promise, a discharged vote below the
+    // restore floor, and an open vote above it — the shape a state
+    // transfer leaves behind.
+    var disk = P.DurableState{};
+    const promised = Ballot{ .round = 5, .node = 3 };
+    try disk.replayFold(.{ .accept = .{
+        .ballot = .{ .round = 2, .node = 1 },
+        .slot = 3,
+        .value = 30,
+    } });
+    try disk.replayFold(.{ .promise = promised });
+    try disk.replayFold(.{ .accept = .{
+        .ballot = .{ .round = 5, .node = 3 },
+        .slot = 7,
+        .value = 70,
+    } });
+
+    var node: P.Node = undefined;
+    try node.restoreAt(2, &membership, &disk, 5, 0);
+
+    // The promise and the open vote above the floor survive; the vote
+    // below the floor is history the image already covers, and its cell
+    // is free again rather than wedged accepted-only forever.
+    try std.testing.expect(!node.durable.promised.lessThan(promised));
+    try std.testing.expectEqual(@as(u64, 70), node.durable.acceptedAt(7).?.value);
+    try std.testing.expectEqual(@as(?P.Accepted, null), node.durable.acceptedAt(3));
+    try std.testing.expectEqual(@as(Slot, 8), node.next_slot);
+}
+
+test "replaying twin trim anchors under one id fails closed" {
+    var disk = TestProtocol.DurableState{};
+    try disk.replayFold(.{ .trim_anchor = .{
+        .trim_id = 3,
+        .chosen_trim_slot = 6,
+        .history_hash = [_]u8{7} ** 32,
+    } });
+    // The identical record replays idempotently.
+    try disk.replayFold(.{ .trim_anchor = .{
+        .trim_id = 3,
+        .chosen_trim_slot = 6,
+        .history_hash = [_]u8{7} ** 32,
+    } });
+    // A twin with the same id and different content is corruption.
+    try std.testing.expectError(error.TrimRegression, disk.replayFold(.{ .trim_anchor = .{
+        .trim_id = 3,
+        .chosen_trim_slot = 6,
+        .history_hash = [_]u8{9} ** 32,
+    } }));
 }
 
 test "a full window reports transient backpressure without reusing a cell" {
