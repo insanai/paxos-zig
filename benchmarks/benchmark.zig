@@ -94,6 +94,7 @@ fn Bench(
     const P = paxos.Protocol(ValueT, .{
         .max_members = node_count,
         .window_slots = window_slots,
+        .recovery_chunk_slots = 256,
     });
     const queue_capacity = 8_192;
     // Leader-to-peer accept, accepted reply, and commit per value.

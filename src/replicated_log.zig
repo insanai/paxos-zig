@@ -41,6 +41,11 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
         if (options.max_batch > options.window_slots) {
             @compileError("paxos ReplicatedLog option max_batch must not exceed window_slots");
         }
+        const chunk = options.recovery_chunk_slots orelse @min(64, options.window_slots);
+        if (options.max_batch > chunk) {
+            @compileError("paxos ReplicatedLog option max_batch " ++
+                "must not exceed recovery_chunk_slots");
+        }
         if (options.max_metadata_bytes > std.math.maxInt(u16)) {
             @compileError("paxos ReplicatedLog option max_metadata_bytes must be at most 65535");
         }

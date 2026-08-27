@@ -742,6 +742,9 @@ pub fn ProtocolGated(
                 [_]SlotSet{.{}} ** options.max_members,
             /// First slot of the chunk the candidate is currently resolving.
             recover_base: Slot = 0,
+            /// Per-peer resume position for chunk-bounded retransmission.
+            resend_cursor: [options.max_members]usize =
+                [_]usize{0} ** options.max_members,
             recovered: [options.window_slots]RecoveredCell =
                 [_]RecoveredCell{.{}} ** options.window_slots,
             lead: [options.window_slots]LeadCell =
@@ -979,6 +982,7 @@ pub fn ProtocolGated(
                 if (!self.voting_member) return error.NotVoter;
                 if (self.role != .leader) return error.NotLeader;
                 if (values.len == 0) return error.EmptyBatch;
+                if (values.len > chunk_slots) return error.BatchTooLarge;
                 if (slots.len < values.len) return error.SlotBufferTooSmall;
                 if (values.len > std.math.maxInt(Slot) - self.next_slot) {
                     return error.GlobalSlotExhausted;
@@ -1860,22 +1864,33 @@ pub fn ProtocolGated(
                 const peer_idx = self.membership.indexOf(peer) orelse return;
                 const peer_decided = self.peer_decided_through[peer_idx];
 
-                for (0..options.window_slots) |index| {
+                // At most one chunk per peer per resend tick keeps every
+                // transition inside the chunk-derived message capacity; the
+                // cursor resumes where the last tick stopped.
+                var scanned: usize = 0;
+                var sent: usize = 0;
+                var index = self.resend_cursor[peer_idx] % options.window_slots;
+                while (scanned < options.window_slots and sent < chunk_slots) {
                     const cell = &self.durable.cells[index];
+                    index = (index + 1) % options.window_slots;
+                    scanned += 1;
                     if (cell.slot == 0 or cell.slot <= peer_decided) continue;
                     if (cell.committed) |value| {
                         self.sendTo(peer, effects, .{ .commit = .{
                             .slot = cell.slot,
                             .value = value,
                         } });
+                        sent += 1;
                     } else if (self.leadProposalAt(cell.slot)) |value| {
                         self.sendTo(peer, effects, .{ .accept = .{
                             .ballot = self.ballot,
                             .slot = cell.slot,
                             .value = value,
                         } });
+                        sent += 1;
                     }
                 }
+                self.resend_cursor[peer_idx] = index;
             }
 
             fn leadProposalAt(self: *const Node, slot: Slot) ?Value {
