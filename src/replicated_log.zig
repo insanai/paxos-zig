@@ -235,6 +235,26 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 self.observeDurable();
             }
 
+            /// Restores one configuration at the host's consumed floor;
+            /// see the core's `restoreAt`.
+            pub fn restoreAt(
+                self: *Node,
+                id: protocol.NodeId,
+                configuration_id: u64,
+                membership: *const Membership,
+                durable: *const DurableState,
+                floor: protocol.Slot,
+                leader_priority: u32,
+            ) !void {
+                if (configuration_id == 0) return error.InvalidConfigurationId;
+                try self.core.restoreAt(id, membership, durable, floor, leader_priority);
+                self.configuration_id = configuration_id;
+                self.stop_sign = null;
+                self.stop_slot = 0;
+                self.stop_pending = false;
+                self.observeDurable();
+            }
+
             /// Restores a non-voting learner from its commit-only journal.
             pub fn restoreLearner(
                 self: *Node,
