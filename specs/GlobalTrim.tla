@@ -41,6 +41,8 @@
 (*   InstallTrim          <-> installChosenTrim + durable TRIM record      *)
 (*   LocalDelete          <-> journal.trimThrough under the T_i formula    *)
 (*   CreateLease/Install/CompleteLease <-> transfer lease lifecycle        *)
+(*   InstallVoter         <-> installTransferredState +                    *)
+(*                            continueOnConfigurationPreserving            *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
@@ -341,6 +343,35 @@ LocalDelete(n) ==
     /\ UNCHANGED <<promised, cells, chosenThrough, anchor, floor, executed,
                    applied, G, leases, joinerCounted, chosenLog, msgs>>
 
+(* In-place voter repair: a lagging data voter installs another data       *)
+(* voter's anchor-pinned image at its applied base.  The sender's applied  *)
+(* frontier covers only executed chosen commands, so the base certifies    *)
+(* its whole prefix; the receiver's applied, executed, chosen summary,     *)
+(* and floor advance to it, and accepted-only votes at or below the base   *)
+(* are discharged history.  The promise and every vote above the base      *)
+(* survive: discarding them would let an older ballot re-choose a slot     *)
+(* this voter already helped choose, the defect the ZDS 0011 audit found  *)
+(* in the first implementation.                                            *)
+InstallVoter(n) ==
+  \E s \in DataVoters \ {n} :
+    /\ n \in DataVoters
+    /\ applied[s] > applied[n]
+    /\ applied' = [applied EXCEPT ![n] = applied[s]]
+    /\ executed' = [executed EXCEPT ![n] = applied[s]]
+    /\ chosenThrough' = [chosenThrough EXCEPT ![n] =
+                           IF applied[s] > @ THEN applied[s] ELSE @]
+    /\ floor' = [floor EXCEPT ![n] =
+                   IF applied[s] > @ THEN applied[s] ELSE @]
+    /\ cells' = [cells EXCEPT ![n] =
+                   [j \in 0..(W - 1) |->
+                      IF /\ cells[n][j].tag /= 0
+                         /\ cells[n][j].tag <= applied[s]
+                         /\ cells[n][j].chosen = None
+                      THEN EmptyCell
+                      ELSE cells[n][j]]]
+    /\ UNCHANGED <<promised, anchor, deleted, G, leases, joinerCounted,
+                   chosenLog, msgs>>
+
 (* Transfer lease lifecycle for the joiner: a cluster-visible lease at a   *)
 (* sender's durable anchor caps every node's deletion, the joiner installs *)
 (* the pinned image at exactly that base, replays the suffix, and is       *)
@@ -382,6 +413,7 @@ Next ==
                          \/ InstallTrim(n) \/ LocalDelete(n)
   \/ \E b \in Ballots, s \in Slots : Accept(b, s) \/ Decide(b, s)
   \/ \E n \in DataNodes : ExecuteNext(n) \/ AnchorState(n) \/ CrashImage(n)
+                            \/ InstallVoter(n)
   \/ ChooseTrim
   \/ CreateLease \/ InstallJoiner \/ CompleteLease
 
