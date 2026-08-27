@@ -417,9 +417,10 @@ const Cluster = struct {
     }
 };
 
-/// Seals via `checkpoint` while a command is still in flight, with one seal
-/// accept dropped, one duplicated, and all delivery shuffled by the seed.
-fn runCheckpointScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u64) !void {
+/// Seals via a same-membership `reconfigure` while a command is still in
+/// flight, with one seal accept dropped, one duplicated, and all delivery
+/// shuffled by the seed.
+fn runSealRaceScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u64) !void {
     try cluster.init(seed, 1, .{ 1, 2, 3 });
     try cluster.elect(0);
     _ = try cluster.appendAt(0, 101);
@@ -429,10 +430,12 @@ fn runCheckpointScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u64) !vo
     // Leave slot 3 in flight so the seal races an open command.
     const open_slot = try cluster.appendAt(0, 103);
     if (open_slot != 3) return cluster.fail("unexpected open slot {d}", .{open_slot});
-    const seal_slot = cluster.nodes[0].checkpoint(
+    const seal_slot = cluster.nodes[0].reconfigure(
+        2,
+        &.{ 1, 2, 3 },
         "snapshot:7",
         &cluster.effects[0],
-    ) catch |err| return cluster.fail("checkpoint returned {t}", .{err});
+    ) catch |err| return cluster.fail("reconfigure returned {t}", .{err});
     try cluster.applyEffects(0);
     if (seal_slot != 4) return cluster.fail("unexpected seal slot {d}", .{seal_slot});
 
@@ -562,14 +565,14 @@ fn runVoterReplacementScenario(cluster: *Cluster, next_epoch: *Cluster, seed: u6
     try next_epoch.expectEpochDecides(2, &.{ 41, 42 });
 }
 
-test "reconfiguration: checkpoint seal survives drop, duplicate, and reorder" {
+test "reconfiguration: seal survives drop, duplicate, and reorder" {
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
     const next_epoch = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(next_epoch);
     var seed: u64 = 1;
     while (seed <= scenario_seeds) : (seed += 1) {
-        try runCheckpointScenario(cluster, next_epoch, seed);
+        try runSealRaceScenario(cluster, next_epoch, seed);
     }
 }
 

@@ -343,24 +343,6 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 return slot;
             }
 
-            /// Seals this bounded epoch and points the next epoch at a snapshot.
-            pub fn checkpoint(
-                self: *Node,
-                snapshot_metadata: []const u8,
-                effects: *Effects,
-            ) !protocol.Slot {
-                if (self.configuration_id == std.math.maxInt(u64)) {
-                    return error.ConfigurationIdExhausted;
-                }
-                const members = self.core.membership.ids[0..self.core.membership.count];
-                return self.reconfigure(
-                    self.configuration_id + 1,
-                    members,
-                    snapshot_metadata,
-                    effects,
-                );
-            }
-
             /// Advances logical clocks and observes any stop sign decision.
             pub fn tick(self: *Node, noop: Value, effects: *Effects) !void {
                 try self.core.tick(.{ .command = noop }, effects);
@@ -686,7 +668,7 @@ test "replicated log batches commands without allocation" {
     try std.testing.expectEqual(@as(protocol.Slot, 3), node.decidedThrough());
 }
 
-test "checkpoint seals an epoch and initializes the next one" {
+test "reconfigure seals an epoch and initializes the next one" {
     const Log = ReplicatedLog(u64, .{
         .max_members = 1,
         .window_slots = 4,
@@ -701,7 +683,7 @@ test "checkpoint seals an epoch and initializes the next one" {
     first.core.ballot = .{ .round = 1, .node = 1 };
     var effects = Log.Effects{};
 
-    _ = try first.checkpoint("state:3", &effects);
+    _ = try first.reconfigure(12, &.{1}, "state:3", &effects);
     const stop = first.isReconfigured().?;
     var next_membership: Log.Membership = undefined;
     var next: Log.Node = undefined;
