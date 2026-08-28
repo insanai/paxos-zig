@@ -79,8 +79,8 @@ const Sample = struct {
 /// time-ordered `ns` array, each divided by `per`, as a JSON integer
 /// array. Feeds the additive `samples_ns_per_value` results field; older
 /// result files simply lack it and keep parsing everywhere.
-fn jsonSamples(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
-    var writer = std.Io.Writer.fixed(buffer);
+fn jsonSamples(out_buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
+    var writer = std.Io.Writer.fixed(out_buffer);
     const stride = (ns.len + max_recorded_samples - 1) / max_recorded_samples;
     try writer.writeByte('[');
     var index: usize = 0;
@@ -96,8 +96,8 @@ fn jsonSamples(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
 /// `per`, as a JSON integer array. Feeds the additive `batch_ns_series`
 /// results field that the periodicity check in tools/bench-gate.zig
 /// reads; older result files simply lack it and keep parsing everywhere.
-fn jsonSeries(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
-    var writer = std.Io.Writer.fixed(buffer);
+fn jsonSeries(out_buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
+    var writer = std.Io.Writer.fixed(out_buffer);
     try writer.writeByte('[');
     for (ns, 0..) |nanoseconds, index| {
         if (index != 0) try writer.writeByte(',');
