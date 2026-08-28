@@ -28,8 +28,8 @@ remote_base="git@github.com:insanai"
 
 # The released paxos-zig archive the published zaxonlite manifest pins.
 # Recompute the hash with `zig fetch <url>` when bumping the release.
-paxos_release_url="https://github.com/insanai/paxos-zig/archive/refs/tags/v0.2.2.tar.gz"
-paxos_release_hash="paxos-0.2.2-_zKMfWbvAgDe98pKuHrMQz163uJOLGBzwWhag8grXjVJ"
+paxos_release_url="https://github.com/insanai/paxos-zig/archive/refs/tags/v0.6.0.tar.gz"
+paxos_release_hash="paxos-0.6.0-_zKMfQnOAwBE8VPidSXbFEGc2NVkYfwgyiqmrL4IRZ6B"
 
 force=""
 for arg in "$@"; do
