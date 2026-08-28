@@ -32,6 +32,7 @@ run() {
 run fmt-style "" . zig build fmt
 run root-test "" . zig build test
 run zds "" . zig build zds
+run zx-fmt "" zaxonlite zig fmt --check build.zig src
 run zx-check "" zaxonlite zig build check
 run zx-test "crash matrix: all 15 cases passed" zaxonlite zig build test
 run zx-crash "all 15 cases passed" zaxonlite zig build test-crash
@@ -40,7 +41,8 @@ run zx-cli "all checks passed" zaxonlite zig build test-cli
 run zx-cluster "all 1 run(s) passed" zaxonlite zig build test-cluster
 run zx-replace "scenario complete" zaxonlite zig build test-replace-cluster
 run zx-transfer "scenario complete" zaxonlite zig build test-transfer-cluster
-run zx-roles "" zaxonlite zig build test-roles
-run zx-fault "" zaxonlite zig build test-fault-network
+run zx-roles "role cluster:" zaxonlite zig build test-roles
+run zx-fault "slow-sync passed" zaxonlite zig build test-fault-network
+run zx-bench "positive control: anchors visible" zaxonlite zig build benchmark
 
 echo "verify: every gate passed"
