@@ -430,7 +430,11 @@ pub fn ProtocolGated(
             writes_count: usize = 0,
             messages: [max_messages]Envelope = undefined,
             messages_count: usize = 0,
-            committed: [options.window_slots]Committed = undefined,
+            // A commit for the next delivery slot may pass through without
+            // claiming its colliding cell, then release every one of the W
+            // resident successors. One transition therefore emits at most
+            // W + 1 application entries, not merely W.
+            committed: [options.window_slots + 1]Committed = undefined,
             committed_count: usize = 0,
             requests: [options.max_members]HostRequest = undefined,
             requests_count: usize = 0,
@@ -2848,6 +2852,40 @@ test "learners release commits only as a contiguous prefix" {
     try std.testing.expectEqual(@as(usize, 2), effects.committed_count);
     try std.testing.expectEqual(@as(Slot, 1), effects.committed[0].slot);
     try std.testing.expectEqual(@as(Slot, 2), effects.committed[1].slot);
+}
+
+test "a pass-through commit can release one more than the window" {
+    const P = Protocol(u64, .{ .max_members = 1, .window_slots = 4 });
+    var membership: P.Membership = undefined;
+    try membership.init(&.{1});
+    var node: P.Node = undefined;
+    try node.init(1, &membership);
+    var effects = P.Effects{};
+
+    // Slots 2 through 5 occupy all four cells. Slot 5 owns slot 1's
+    // physical cell, so the later commit for slot 1 takes recordCommit's
+    // pass-through path and then releases the four resident successors.
+    var slot: Slot = 2;
+    while (slot <= 5) : (slot += 1) {
+        try node.step(.{
+            .from = 1,
+            .to = 1,
+            .message = .{ .commit = .{ .slot = slot, .value = slot * 10 } },
+        }, &effects);
+        try std.testing.expectEqual(@as(usize, 0), effects.committed_count);
+        effects.confirmWritesDurable();
+    }
+
+    try node.step(.{
+        .from = 1,
+        .to = 1,
+        .message = .{ .commit = .{ .slot = 1, .value = 10 } },
+    }, &effects);
+    try std.testing.expectEqual(@as(usize, 5), effects.committed_count);
+    for (effects.committedSlice(), 1..) |committed, expected_slot| {
+        try std.testing.expectEqual(@as(Slot, expected_slot), committed.slot);
+        try std.testing.expectEqual(@as(u64, expected_slot * 10), committed.value);
+    }
 }
 
 test "effects track durability confirmation for each write batch" {
