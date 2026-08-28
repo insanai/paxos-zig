@@ -16,6 +16,14 @@
 //!
 //! Numbers depend on the filesystem and disk; they are orders of magnitude
 //! above the in-memory results, which is the honest cost of durability.
+//!
+//! Besides the whole-run totals, the median run records the wall time of
+//! every durable operation (one proposed-and-committed group, including
+//! its fsyncs) and emits the additive `samples_ns_per_value` and
+//! `batch_ns_series` result fields so tools/bench-gate.zig can enforce
+//! durable rows statistically. Clock reads cost tens of nanoseconds
+//! against multi-millisecond fsyncs, so the headline aggregates stay
+//! computed from the whole-run start-to-finish time exactly as before.
 
 const std = @import("std");
 const paxos = @import("paxos");
@@ -24,6 +32,10 @@ const node_count = 3;
 const value_count = 512;
 const sample_count = 3;
 const record_size = 37;
+
+/// Cap on raw samples recorded per run, matching the in-memory
+/// benchmark's stride and the gate's minimum enforced sample count.
+const max_recorded_samples = 64;
 
 const P = paxos.host_managed.Protocol(u64, .{
     .max_members = node_count,
@@ -45,6 +57,11 @@ const State = struct {
     pending: [node_count][1_024]P.Envelope,
     pending_count: [node_count]usize,
     encode_buffer: [record_size * (2 * value_count + 1)]u8,
+    /// Wall time of each durable group per sample run, in issue order.
+    batch_ns: [sample_count][value_count]u64,
+    /// Holds the full per-group series as JSON; sized for the widest
+    /// possible u64 entry plus its separator.
+    series_buffer: [21 * value_count + 2]u8,
 };
 
 var state: State = undefined;
@@ -53,7 +70,42 @@ const Sample = struct {
     nanoseconds: u64,
     fsyncs: u64,
     checksum: u64,
+    /// Index into `state.batch_ns`, so the sort below keeps each total
+    /// attached to its per-group timing series.
+    index: usize,
 };
+
+/// Formats at most `max_recorded_samples` evenly-strided entries of the
+/// time-ordered `ns` array, each divided by `per`, as a JSON integer
+/// array. Feeds the additive `samples_ns_per_value` results field; older
+/// result files simply lack it and keep parsing everywhere.
+fn jsonSamples(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    const stride = (ns.len + max_recorded_samples - 1) / max_recorded_samples;
+    try writer.writeByte('[');
+    var index: usize = 0;
+    while (index < ns.len) : (index += stride) {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{ns[index] / per});
+    }
+    try writer.writeByte(']');
+    return writer.buffered();
+}
+
+/// Formats the whole time-ordered `ns` array, each entry divided by
+/// `per`, as a JSON integer array. Feeds the additive `batch_ns_series`
+/// results field that the periodicity check in tools/bench-gate.zig
+/// reads; older result files simply lack it and keep parsing everywhere.
+fn jsonSeries(buffer: []u8, ns: []const u64, per: u64) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    try writer.writeByte('[');
+    for (ns, 0..) |nanoseconds, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{d}", .{nanoseconds / per});
+    }
+    try writer.writeByte(']');
+    return writer.buffered();
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -65,6 +117,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runMode(io: std.Io, name: []const u8, window: u32) !void {
+    // Uniform groups keep the per-value normalization of the timing
+    // arrays exact; both shipped modes divide value_count evenly.
+    std.debug.assert(value_count % window == 0);
     var samples: [sample_count]Sample = undefined;
     for (&samples, 0..) |*sample, index| {
         sample.* = try runSample(io, window, index);
@@ -96,22 +151,30 @@ fn runMode(io: std.Io, name: []const u8, window: u32) !void {
         per_value,                             median.fsyncs,
         median.checksum,
     });
+    // The median run's per-group timings, normalized per value. Serialized
+    // in issue order so the series keeps its time structure.
+    const groups = value_count / window;
+    const timed = state.batch_ns[median.index][0..groups];
+    var sample_buffer: [2048]u8 = undefined;
+    const samples_json = try jsonSamples(&sample_buffer, timed, window);
+    const series_json = try jsonSeries(&state.series_buffer, timed, window);
     std.debug.print(
         "{{\"impl\":\"paxos-zig\",\"workload\":\"durable-u64-3n\"," ++
             "\"mode\":\"{s}\",\"values\":{d},\"nodes\":{d}," ++
             "\"payload_bytes\":8,\"ns_total_median\":{d}," ++
             "\"ns_total_min\":{d},\"ns_total_max\":{d}," ++
-            "\"ns_per_value\":{d:.2},\"fsyncs\":{d},\"checksum\":{d}}}\n\n",
+            "\"ns_per_value\":{d:.2},\"fsyncs\":{d},\"checksum\":{d}," ++
+            "\"samples_ns_per_value\":{s},\"batch_ns_series\":{s}}}\n\n",
         .{
             name,                   value_count,
             node_count,             median.nanoseconds,
             samples[0].nanoseconds, samples[sample_count - 1].nanoseconds,
             per_value,              median.fsyncs,
-            median.checksum,
+            median.checksum,        samples_json,
+            series_json,
         },
     );
     const expected = value_count * (value_count + 1) / 2;
-    const groups = (value_count + window - 1) / window;
     const expected_fsyncs = groups * 6;
     if (median.checksum != expected or median.fsyncs != expected_fsyncs) {
         std.debug.print("SELF-CHECK FAILED for durable/{s}\n", .{name});
@@ -139,8 +202,13 @@ fn runSample(io: std.Io, window: u32, sample_index: usize) !Sample {
     // fsync accounting as well.
     s.fsyncs = 0;
 
+    // Per-group clock reads cost tens of nanoseconds against fsyncs
+    // costing milliseconds; the aggregate below still spans the whole
+    // run start to finish and is never derived from the group timings.
     const started = std.Io.Clock.Timestamp.now(io, .awake);
+    var previous = started;
     var seq: u64 = 1;
+    var batch_index: usize = 0;
     while (seq <= value_count) {
         const batch: u64 = @min(window, value_count - seq + 1);
         for (0..batch) |offset| {
@@ -150,6 +218,11 @@ fn runSample(io: std.Io, window: u32, sample_index: usize) !Sample {
         try flushNode(io, 0);
         try drainGrouped(io, window);
         seq += batch;
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        s.batch_ns[sample_index][batch_index] =
+            @intCast(previous.durationTo(now).raw.nanoseconds);
+        previous = now;
+        batch_index += 1;
     }
     const finished = std.Io.Clock.Timestamp.now(io, .awake);
 
@@ -171,6 +244,7 @@ fn runSample(io: std.Io, window: u32, sample_index: usize) !Sample {
         .nanoseconds = @intCast(started.durationTo(finished).raw.nanoseconds),
         .fsyncs = s.fsyncs,
         .checksum = checksum,
+        .index = sample_index,
     };
 }
 

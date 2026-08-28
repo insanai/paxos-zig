@@ -4,7 +4,7 @@
 //! Compares a baseline and a candidate results file (the JSON emitted into
 //! benchmarks/results/) and exits nonzero only when a matched paxos-zig
 //! run whose records BOTH carry a raw `samples_ns_per_value` array of at
-//! least 32 observations, recorded in matching environments, regresses.
+//! least 64 observations, recorded in matching environments, regresses.
 //! Per matched pair the Hodges-Lehmann shift between the
 //! two sample vectors is estimated with a percentile-bootstrap 95%
 //! confidence interval under a fixed PRNG seed, so repeated invocations
@@ -14,11 +14,13 @@
 //! fails when the interval's upper bound exceeds +3% of the baseline
 //! median for in-memory workloads or +5% for durable workloads.
 //!
-//! Pairs are matched on workload and mode plus every fixture-defining
-//! numeric field both records carry (values, nodes, payload_bytes,
-//! values_per_iteration, measurement_iterations, max_slots, window_slots,
-//! wraps). A pair differing in any present fixture field describes two
-//! different experiments; it is skipped with a printed reason and never
+//! Pairs are matched on workload and mode plus the fixture-defining
+//! numeric fields (values, nodes, payload_bytes, values_per_iteration,
+//! measurement_iterations, max_slots, window_slots, wraps). A pair
+//! differing in any fixture field describes two different experiments,
+//! and a fixture field carried by only one record leaves the experiments
+//! unidentifiable as the same one; either way the pair is INCOMPARABLE
+//! and is skipped with a printed reason naming the field, never
 //! compared.
 //!
 //! Runs recorded before the raw field existed expose only summary
@@ -35,9 +37,9 @@
 //! bootstrapped by resampling those differences. Raw sample arrays use
 //! the two-sample form (median of all pairwise differences) with
 //! independent resampling of each side. A raw pair where either side has
-//! fewer than 32 observations is likewise report-only ("insufficient
-//! samples"): the bootstrap interval of a tiny sample is too fragile to
-//! gate on.
+//! fewer than 64 observations (the ZDS power derivation's minimum) is
+//! likewise report-only ("insufficient samples"): the bootstrap interval
+//! of a small sample is too fragile to gate on.
 //!
 //! When both files record environment metadata (meta host, cpu, os, zig)
 //! any difference downgrades every raw pair to report-only with a printed
@@ -76,26 +78,28 @@ const usage_text =
     \\  ns_total_min/median/max divided by "values"   durable runs
     \\
     \\Runs lacking every source are ignored. Runs pair on workload and
-    \\mode plus every fixture-defining numeric field both records carry
-    \\(values, nodes, payload_bytes, values_per_iteration,
-    \\measurement_iterations, max_slots, window_slots, wraps); a pair
-    \\differing in any present fixture field is skipped with a printed
-    \\reason instead of being compared.
+    \\mode plus the fixture-defining numeric fields (values, nodes,
+    \\payload_bytes, values_per_iteration, measurement_iterations,
+    \\max_slots, window_slots, wraps); a pair differing in any fixture
+    \\field, or carrying a fixture field on only one side, is
+    \\incomparable and is skipped with a printed reason naming the field
+    \\instead of being compared.
     \\
     \\The gate is the bootstrap 95% upper confidence bound of the
     \\Hodges-Lehmann shift: it must stay at or below +3% of the baseline
     \\median, or +5% for workloads whose name starts with "durable". Only
-    \\pairs where BOTH runs carry at least 32 raw samples_ns_per_value
-    \\observations, recorded in matching environments, are enforced (exit
-    \\1 on regression). Every other matched pair is report-only and never
-    \\affects the exit code: summary-quantile pairs, raw pairs below 32
-    \\observations ("insufficient samples (N < 32)"), and every pair when
-    \\the meta host/cpu/os/zig fields differ between the files. Durable
-    \\rows record only ns_total min/median/max today (no per-operation
-    \\timing array exists in benchmarks/durable.zig), so durable pairs
-    \\stay report-only until their producer records raw samples. Quantile
-    \\summaries are compared as paired per-quantile differences; raw
-    \\arrays as all pairwise differences.
+    \\pairs where BOTH runs carry at least 64 raw samples_ns_per_value
+    \\observations (the ZDS power derivation's minimum), recorded in
+    \\matching environments, are enforced (exit 1 on regression). Every
+    \\other matched pair is report-only and never affects the exit code:
+    \\summary-quantile pairs, raw pairs below 64 observations
+    \\("insufficient samples (N < 64)"), and every pair when the meta
+    \\host/cpu/os/zig fields differ between the files. Durable rows
+    \\emitted by the current benchmarks/durable.zig carry per-operation
+    \\samples_ns_per_value and are enforced like any raw pair; older
+    \\durable rows with only ns_total min/median/max stay report-only.
+    \\Quantile summaries are compared as paired per-quantile differences;
+    \\raw arrays as all pairwise differences.
     \\
     \\Within-run observations share one process lifetime and are
     \\autocorrelated, so the bootstrap interval understates variance; it
@@ -121,8 +125,9 @@ const in_memory_limit: f64 = 0.03;
 const durable_limit: f64 = 0.05;
 
 /// Raw pairs where either side records fewer observations than this are
-/// too fragile to gate on and downgrade to report-only.
-const min_raw_samples = 32;
+/// too fragile to gate on and downgrade to report-only. 64 matches the
+/// ZDS power derivation and the emitters' recorded sample stride.
+const min_raw_samples = 64;
 
 /// Predeclared report-only autocorrelation threshold for periodicity.
 const autocorrelation_flag = 0.2;
@@ -262,10 +267,12 @@ fn warnEnvironment(base: Meta, cand: Meta, out: *Io.Writer) !bool {
 }
 
 /// Fixture-defining numeric fields: two runs describe the same experiment
-/// only when every one of these carried by both records is equal. The
-/// result families differ (matrix runs carry values_per_iteration and
-/// max_slots, the moving run window_slots and wraps, durable runs
-/// neither), so only fields present on both sides are compared.
+/// only when every one of these is either absent from both records or
+/// present with equal values on both. The result families differ (matrix
+/// runs carry values_per_iteration and max_slots, the moving run
+/// window_slots and wraps, durable runs neither), so a field carried by
+/// only one side means the records come from different producer versions
+/// and the pair is incomparable.
 const fixture_field_names = [_][]const u8{
     "values",                 "nodes",
     "payload_bytes",          "values_per_iteration",
@@ -467,9 +474,16 @@ fn gateAll(
             continue;
         };
         if (fixtureMismatch(base, cand)) |diff| {
+            var base_text: [40]u8 = undefined;
+            var cand_text: [40]u8 = undefined;
             try out.print(
-                "skip {s}/{s}: fixture mismatch on {s} (baseline {d} vs candidate {d})\n",
-                .{ cand.workload, cand.mode, diff.name, diff.base, diff.cand },
+                "skip {s}/{s}: incomparable fixture field {s} " ++
+                    "(baseline {s} vs candidate {s})\n",
+                .{
+                    cand.workload,                      cand.mode,
+                    diff.name,                          fixtureText(&base_text, diff.base),
+                    fixtureText(&cand_text, diff.cand),
+                },
             );
             continue;
         }
@@ -550,20 +564,31 @@ fn pairPolicy(base: *const Run, cand: *const Run, env_mismatch: bool) PairPolicy
 
 const FixtureDiff = struct {
     name: []const u8,
-    base: f64,
-    cand: f64,
+    base: ?f64,
+    cand: ?f64,
 };
 
-/// First fixture-defining field carried by both records with differing
-/// values; null when the two runs describe the same experiment.
+/// First fixture-defining field that makes the pair incomparable: one
+/// carried by both records with differing values, or one carried by only
+/// one record. Null when the two runs describe the same experiment.
 fn fixtureMismatch(base: *const Run, cand: *const Run) ?FixtureDiff {
     for (fixture_field_names, base.fixture, cand.fixture) |name, base_slot, cand_slot| {
-        const base_value = base_slot orelse continue;
-        const cand_value = cand_slot orelse continue;
+        if (base_slot == null and cand_slot == null) continue;
+        const base_value = base_slot orelse
+            return .{ .name = name, .base = null, .cand = cand_slot };
+        const cand_value = cand_slot orelse
+            return .{ .name = name, .base = base_value, .cand = null };
         if (base_value == cand_value) continue;
         return .{ .name = name, .base = base_value, .cand = cand_value };
     }
     return null;
+}
+
+/// Formats one side of a fixture diff; an absent field prints as
+/// "absent" so one-sided records are visibly incomparable.
+fn fixtureText(buffer: []u8, value: ?f64) []const u8 {
+    const number = value orelse return "absent";
+    return std.fmt.bufPrint(buffer, "{d}", .{number}) catch "?";
 }
 
 fn findRun(runs: []const Run, workload: []const u8, mode: []const u8) ?*const Run {
@@ -945,15 +970,16 @@ test "a quantile-only regression is report-only and never fails the gate" {
     try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, false));
 }
 
-test "a raw pair below 32 samples is report-only and never fails the gate" {
-    var base: [16]f64 = undefined;
-    var cand: [16]f64 = undefined;
+test "a raw pair below 64 samples is report-only and never fails the gate" {
+    // 32 observations satisfied the old bar and must no longer be enough.
+    var base: [32]f64 = undefined;
+    var cand: [32]f64 = undefined;
     fillRegression(&base, &cand, 1.10);
     const base_run = testRun(.raw, &base);
     const cand_run = testRun(.raw, &cand);
     const policy = pairPolicy(&base_run, &cand_run, false);
     try std.testing.expectEqual(PolicyReason.few_samples, policy.reason);
-    try std.testing.expectEqual(@as(usize, 16), policy.sample_count);
+    try std.testing.expectEqual(@as(usize, 32), policy.sample_count);
     var base_runs = [_]Run{base_run};
     var cand_runs = [_]Run{cand_run};
     try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, false));
@@ -987,12 +1013,31 @@ test "a fixture mismatch skips the pair instead of comparing it" {
     clean_base.workload = "u64-3n";
     var clean_cand = testRun(.raw, &same);
     clean_cand.workload = "u64-3n";
-    // A field carried by only one side never blocks the pair.
-    try std.testing.expect(fixtureMismatch(&mismatched_base, &clean_cand) == null);
 
     var base_runs = [_]Run{ mismatched_base, clean_base };
     var cand_runs = [_]Run{ mismatched_cand, clean_cand };
     try std.testing.expectEqual(exit_ok, try testGateAll(&base_runs, &cand_runs, false));
+}
+
+test "a one-sided fixture field makes the pair incomparable" {
+    var base: [64]f64 = undefined;
+    var cand: [64]f64 = undefined;
+    fillRegression(&base, &cand, 1.10);
+    var one_sided_base = testRun(.raw, &base);
+    one_sided_base.fixture[0] = 4096;
+    const one_sided_cand = testRun(.raw, &cand);
+    const diff = fixtureMismatch(&one_sided_base, &one_sided_cand).?;
+    try std.testing.expectEqualStrings("values", diff.name);
+    try std.testing.expectEqual(@as(?f64, 4096), diff.base);
+    try std.testing.expectEqual(@as(?f64, null), diff.cand);
+    // The mirrored orientation is incomparable too.
+    try std.testing.expect(fixtureMismatch(&one_sided_cand, &one_sided_base) != null);
+    // The regressed pair is skipped, not compared; with nothing else to
+    // compare the gate fails loudly on "no comparable runs" rather than
+    // passing a regression it silently refused to look at.
+    var base_runs = [_]Run{one_sided_base};
+    var cand_runs = [_]Run{one_sided_cand};
+    try std.testing.expectEqual(exit_fail, try testGateAll(&base_runs, &cand_runs, false));
 }
 
 test "autocorrelation flags an injected periodic series" {
