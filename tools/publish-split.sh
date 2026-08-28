@@ -19,9 +19,12 @@ set -eu
 # replacing the path with the released paxos-zig archive URL + content
 # hash. The commit's author, committer, message, and dates are fixed
 # (dates reuse the split tip's author date), so reruns reproduce the
-# identical SHA and pushes stay fast-forward. Tags are still a manual
-# release step: tag the rewritten split tip locally and push it to the
-# split remote (plain vX.Y.Z, matching the existing scheme).
+# identical SHA. The publisher-only pin is not an ancestor of the next
+# raw subtree split, however, so `push_zaxonlite` joins those two histories
+# with a tree-preserving merge after proving that the remote-only tree
+# change is exactly build.zig.zon. No product file can be lost silently.
+# Tags are still a manual release step: tag the rewritten split tip locally
+# and push it to the split remote (plain vX.Y.Z, matching the existing scheme).
 
 cd "$(git rev-parse --show-toplevel)"
 remote_base="git@github.com:insanai"
@@ -48,6 +51,45 @@ publish_subtree() {
     git branch -D "$branch" >/dev/null
 }
 
+push_zaxonlite() {
+    branch="$1"
+    remote="${remote_base}/zaxonlite.git"
+    if [ -n "$force" ]; then
+        git push $force "$remote" "refs/heads/${branch}:refs/heads/main"
+        return
+    fi
+
+    remote_ref="refs/remotes/split-publish/zaxonlite-main"
+    git fetch --quiet "$remote" "+refs/heads/main:${remote_ref}"
+    if git merge-base --is-ancestor "$remote_ref" "$branch"; then
+        git push "$remote" "refs/heads/${branch}:refs/heads/main"
+        return
+    fi
+    if [ "$(git rev-parse "${remote_ref}^{tree}")" = "$(git rev-parse "${branch}^{tree}")" ]; then
+        return
+    fi
+
+    base="$(git merge-base "$remote_ref" "$branch")"
+    changed="$(git diff --name-only "$base" "$remote_ref")"
+    if [ "$changed" != "build.zig.zon" ]; then
+        echo "error: zaxonlite upstream has non-publisher changes:" >&2
+        printf '%s\n' "$changed" >&2
+        exit 1
+    fi
+    tree="$(git rev-parse "${branch}^{tree}")"
+    tip_date="$(git log -1 --format=%aI "$branch")"
+    merge_commit="$(
+        printf '%s\n' "publish: reconcile the standalone manifest history" |
+        GIT_AUTHOR_NAME="publish-split" GIT_AUTHOR_EMAIL="publish@insan.ai" \
+        GIT_AUTHOR_DATE="$tip_date" \
+        GIT_COMMITTER_NAME="publish-split" GIT_COMMITTER_EMAIL="publish@insan.ai" \
+        GIT_COMMITTER_DATE="$tip_date" \
+            git commit-tree "$tree" -p "$remote_ref" -p "$branch"
+    )"
+    git branch -f "$branch" "$merge_commit" >/dev/null
+    git push "$remote" "refs/heads/${branch}:refs/heads/main"
+}
+
 # zaxonlite: subtree split plus the deterministic manifest-pin commit
 # described in the header. Runs after the workdir/trap setup below.
 publish_zaxonlite() {
@@ -72,8 +114,8 @@ publish_zaxonlite() {
         GIT_COMMITTER_DATE="$tip_date" \
             git commit -qam "publish: pin paxos to the released archive"
     )
-    git push $force "${remote_base}/zaxonlite.git" "refs/heads/${branch}:refs/heads/main"
     git worktree remove --force "$workdir/zaxonlite"
+    push_zaxonlite "$branch"
     git branch -D "$branch" >/dev/null
 }
 
