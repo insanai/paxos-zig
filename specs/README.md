@@ -211,21 +211,26 @@ runs support the bounded result: `MaxSlot = 4` at bound eighteen
 explored 963 million states to depth 14, and at bound twenty-two 210
 million states to depth 13, with no violation before being stopped.
 
-Recorded deep sweep of `GlobalTrim.cfg` (2026-08-27, TLC 2.14,
-OpenJDK 21, 32 workers with a 64 GB heap on an AMD Ryzen 9 5950X
-16-core/32-thread machine with 128 GB RAM running Ubuntu Linux):
-1,851,663,739 states generated, 246,373,889 distinct, depth 15, every
-invariant and the `Monotone` property holding throughout, sustained at
-roughly 24 million generated states per minute. The sweep was stopped
-by decision, not exhaustion: the `MaxMessages = 16` space is larger
-than the full-completion budget, the guarantee at this depth is already
-far past what the deliberate-bug validations need, and a 32-worker TLC
-checkpoint is preserved on that machine
-(`~/tlc-checkpoints/GlobalTrim-fresh32/metadir`) to finish the
-enumeration later for completeness. A `-recover` resume must use the
-same worker count the checkpoint was written with, and identical spec,
-config, and `tla2tools.jar`. The `GlobalTrim5.cfg` sweep is queued for
-the same later pass; give it a `SYMMETRY` set over the three
+Recorded deep sweep of `GlobalTrim.cfg` (2026-08-27 through
+2026-08-31, TLC 2.14, OpenJDK 21, 32 workers with a 64 GB heap on an
+AMD Ryzen 9 5950X 16-core/32-thread machine with 128 GB RAM running
+Ubuntu Linux, roughly 4.3 days of wall clock): 81,088,518,501 states
+generated, 7,550,447,755 distinct, exhaustive through depth 17 and
+deep into depth 18, every invariant and the `Monotone` property
+holding throughout, sustained at roughly 15-17 million generated
+states per minute. The sweep was parked by decision, not exhaustion:
+at the stop the breadth-first frontier still held 5,117,100,803
+queued states and was oscillating rather than draining, so full
+enumeration of the `MaxMessages = 16` space was projected in weeks
+while the guarantee at this depth is already far past what the
+deliberate-bug validations need. The run was stopped immediately
+after a completed 32-worker TLC checkpoint, preserved on that machine
+(`~/tlc-checkpoints/GlobalTrim-fresh32/metadir`, checkpoint of
+2026-08-31 14:46 UTC) to finish the enumeration later for
+completeness. A `-recover` resume must use the same worker count the
+checkpoint was written with, and identical spec, config, and
+`tla2tools.jar`. The `GlobalTrim5.cfg` sweep runs next on the same
+machine; give any future rerun a `SYMMETRY` set over the three
 interchangeable data voters, which is sound for the safety invariants
 and the `Monotone` action property checked here.
 
