@@ -229,10 +229,21 @@ after a completed 32-worker TLC checkpoint, preserved on that machine
 2026-08-31 14:46 UTC) to finish the enumeration later for
 completeness. A `-recover` resume must use the same worker count the
 checkpoint was written with, and identical spec, config, and
-`tla2tools.jar`. The `GlobalTrim5.cfg` sweep runs next on the same
-machine; give any future rerun a `SYMMETRY` set over the three
-interchangeable data voters, which is sound for the safety invariants
-and the `Monotone` action property checked here.
+`tla2tools.jar`.
+
+Recorded deep sweep of `GlobalTrim5.cfg` (2026-08-31 through
+2026-09-01, same machine and TLC build, roughly twelve hours of wall
+clock): 4,636,886,782 states generated, 597,590,755 distinct, depth
+13, every invariant and the `Monotone` property holding throughout at
+roughly 6 million generated states per minute -- five-node states are
+larger, so the sweep runs slower than the three-node one. It was
+parked the same way, immediately after a completed checkpoint
+(`~/tlc-checkpoints/GlobalTrim5/metadir`, checkpoint of 2026-09-01
+02:48 UTC), with 468,866,274 states still queued and the frontier
+still expanding. Give any future resume-to-completion attempt a
+`SYMMETRY` set over the three interchangeable data voters, which is
+sound for the safety invariants and the `Monotone` action property
+checked here.
 
 For unbounded-depth results in minutes instead of enumeration hours,
 the follow-up is Apalache's inductive mode: annotate the spec with
@@ -246,11 +257,19 @@ The in-place voter transfer is modeled: `InstallVoter` carries the
 preservation rule (promise unchanged, cells above the base retained,
 accepted-only cells at or below it discharged by the anchor), matching
 `installTransferredState` plus `continueOnConfigurationPreserving`.
-Its validation pair is queued on the verification machine behind the
-exhaustive base sweep: a deliberate-bug variant restoring the
-pre-audit reset behavior (which must produce a counterexample) and a
-checkpointed clean sweep of the extended spec at the full bound; bank
-both results here when they land.
+Its deliberate-bug validation is banked: a variant spec restoring the
+pre-audit reset behavior (install rebuilding the receiver from an
+empty durable state) makes TLC report `AcceptedOnlySlotNeverEvicted`
+-- the reset discards the receiver's accepted-only votes, exactly the
+phase-two obligation nothing may erase -- with a depth-17
+counterexample found in one hour and twenty-two minutes on the
+verification machine (2026-09-01, `MaxMessages = 12`, 2,583,309,489
+states generated, 108,129,640 distinct; the complete graph depth at
+that bound is also 17, so the shortest counterexample sits at the very
+bottom of the model). The companion clean sweep of the
+`InstallVoter`-extended spec at the full `MaxMessages = 16` bound runs
+checkpointed on the same machine; bank its certificate here when it is
+parked or completes.
 
 The invariants are not vacuous: removing the eviction guard's
 chosen-and-below-floor condition makes TLC report
