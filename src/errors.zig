@@ -28,6 +28,7 @@ pub fn explainError(err: anyerror) []const u8 {
         => explainRoleError(err),
 
         error.NotLeader,
+        error.LeaderCatchingUp,
         error.WindowFull,
         error.GlobalSlotExhausted,
         error.EmptyBatch,
@@ -198,6 +199,13 @@ fn explainProgressError(err: anyerror) []const u8 {
         \\
         \\This node has not completed phase one for its current ballot.
         \\Hint: Route to currentLeader() or wait for a successful campaign.
+        ,
+        error.LeaderCatchingUp =>
+        \\-- LEADER CATCHING UP -----------------------------------------------------------
+        \\
+        \\Phase one succeeded, but slots inherited from earlier ballots are not yet
+        \\delivered and the gate option refuses new proposals until they are.
+        \\Hint: Deliver through leaderBase() - 1 (drive catch-up if needed), then retry.
         ,
         error.WindowFull =>
         \\-- WINDOW FULL ------------------------------------------------------------------

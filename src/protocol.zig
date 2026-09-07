@@ -40,6 +40,12 @@ pub const Options = struct {
     heartbeat_interval_ticks: u32 = 3,
     /// Leader ticks between bounded retransmission scans.
     resend_interval_ticks: u32 = 10,
+    /// Refuse `propose` and `proposeBatch` with `LeaderCatchingUp` until
+    /// every slot this leadership inherited from earlier ballots is
+    /// delivered. Hosts whose values derive from applied state (hash
+    /// chains, compare-and-set, sequence numbers) need it; hosts with
+    /// independent values keep pipelining across the takeover.
+    gate_proposals_on_inherited_prefix: bool = false,
 };
 
 /// Whether the generated type enforces the persist-then-send ordering
@@ -776,6 +782,10 @@ pub fn ProtocolGated(
             highest_observed_round: u64 = 0,
             leader_hint: ?NodeId = null,
             next_slot: Slot = 1,
+            /// First slot this leadership may fill with a new value. Every
+            /// lower slot was decided, re-proposed, or learned during phase
+            /// one; the host reads it through `leaderBase`.
+            leader_base: Slot = 1,
             delivered_through: Slot = 0,
             leader_priority: u32 = 0,
             voting_member: bool = true,
@@ -1045,6 +1055,7 @@ pub fn ProtocolGated(
                 effects.reset();
                 if (!self.voting_member) return error.NotVoter;
                 if (self.role != .leader) return error.NotLeader;
+                if (!self.inheritedPrefixDelivered()) return error.LeaderCatchingUp;
                 if (self.next_slot == std.math.maxInt(Slot)) return error.GlobalSlotExhausted;
                 if (self.next_slot - self.memory_floor > options.window_slots) {
                     return error.WindowFull;
@@ -1068,6 +1079,7 @@ pub fn ProtocolGated(
                 effects.reset();
                 if (!self.voting_member) return error.NotVoter;
                 if (self.role != .leader) return error.NotLeader;
+                if (!self.inheritedPrefixDelivered()) return error.LeaderCatchingUp;
                 if (values.len == 0) return error.EmptyBatch;
                 if (values.len > chunk_slots) return error.BatchTooLarge;
                 if (slots.len < values.len) return error.SlotBufferTooSmall;
@@ -1261,6 +1273,31 @@ pub fn ProtocolGated(
             pub fn decidedThrough(self: *const Node) Slot {
                 self.assertValid();
                 return self.delivered_through;
+            }
+
+            /// Returns the first slot the current leadership may fill with a
+            /// new value. Every lower slot was decided, re-proposed under this
+            /// ballot, or requested from a peer during phase one, so a host
+            /// whose values depend on applied state must deliver through
+            /// `leaderBase() - 1` before it derives a proposal. Meaningful
+            /// only while `role == .leader`.
+            pub fn leaderBase(self: *const Node) Slot {
+                self.assertValid();
+                return self.leader_base;
+            }
+
+            /// Returns the slot the next proposal would take. Every lower
+            /// slot is decided or in flight.
+            pub fn proposalFrontier(self: *const Node) Slot {
+                self.assertValid();
+                return self.next_slot;
+            }
+
+            /// Whether the gate option permits a proposal now: either the
+            /// option is off or the inherited prefix is delivered.
+            fn inheritedPrefixDelivered(self: *const Node) bool {
+                if (!options.gate_proposals_on_inherited_prefix) return true;
+                return self.delivered_through + 1 >= self.leader_base;
             }
 
             /// Copies a decided contiguous suffix into caller-owned storage.
@@ -1604,6 +1641,7 @@ pub fn ProtocolGated(
                     @max(fences.trim, fences.chosen),
                 );
                 self.next_slot = @max(self.next_slot, highest + 1);
+                self.leader_base = self.next_slot;
                 // A leader restored from its journal re-releases its own
                 // contiguous committed prefix; peers hear re-broadcast
                 // commits during resolution, but nobody sends commits to
@@ -2378,6 +2416,98 @@ test "phase one tolerates reordering and recovers the highest accepted value" {
     }
     try std.testing.expectEqual(TestProtocol.Role.leader, nodes[2].role);
     try std.testing.expect(saw_recovered_accept);
+}
+
+/// Drives a takeover in which node 3 recovers an accept for slot 1 from
+/// node 2 and becomes leader while that slot is still undecided. Returns
+/// the leader so the caller can inspect the term base and propose.
+fn takeoverWithInheritedSlot(comptime P: type, nodes: *[3]P.Node) !void {
+    var membership: P.Membership = undefined;
+    try membership.init(&.{ 1, 2, 3 });
+    const lower = Ballot{ .round = 1, .node = 1 };
+    const higher = Ballot{ .round = 1, .node = 2 };
+
+    var first_disk = P.DurableState{ .promised = lower };
+    first_disk.cells[1] = .{ .slot = 1, .accepted = .{ .ballot = lower, .value = 77 } };
+    var second_disk = P.DurableState{ .promised = higher };
+    second_disk.cells[1] = .{ .slot = 1, .accepted = .{ .ballot = higher, .value = 88 } };
+
+    try nodes[0].restore(1, &membership, &first_disk);
+    try nodes[1].restore(2, &membership, &second_disk);
+    try nodes[2].init(3, &membership);
+    var effects = P.Effects{};
+    try nodes[2].campaign(0, &effects);
+    var replies: [6]P.Envelope = undefined;
+    var reply_count: usize = 0;
+    for (effects.messagesSlice()) |prepare| {
+        const index: usize = prepare.to - 1;
+        var inner = P.Effects{};
+        try nodes[index].step(prepare, &inner);
+        inner.confirmWritesDurable();
+        for (inner.messagesSlice()) |reply| {
+            replies[reply_count] = reply;
+            reply_count += 1;
+        }
+    }
+    for (replies[0..reply_count]) |reply| {
+        try nodes[2].step(reply, &effects);
+        effects.confirmWritesDurable();
+    }
+    try std.testing.expectEqual(P.Role.leader, nodes[2].role);
+}
+
+test "a new leader reports the first slot above everything it inherited" {
+    var nodes: [3]TestProtocol.Node = undefined;
+    try takeoverWithInheritedSlot(TestProtocol, &nodes);
+    const leader = &nodes[2];
+    // Slot 1 is re-proposed under the new ballot and still undecided.
+    try std.testing.expectEqual(@as(Slot, 0), leader.decidedThrough());
+    try std.testing.expectEqual(@as(Slot, 2), leader.leaderBase());
+    try std.testing.expectEqual(@as(Slot, 2), leader.proposalFrontier());
+    // Without the gate, proposals pipeline above the inherited slot.
+    var effects = TestProtocol.Effects{};
+    try std.testing.expectEqual(@as(Slot, 2), try leader.propose(5, &effects));
+    try std.testing.expectEqual(@as(Slot, 3), leader.proposalFrontier());
+}
+
+test "the inherited-prefix gate refuses proposals until the takeover delivers" {
+    const Gated = Protocol(u64, .{
+        .max_members = 3,
+        .window_slots = 16,
+        .gate_proposals_on_inherited_prefix = true,
+    });
+    var nodes: [3]Gated.Node = undefined;
+    try takeoverWithInheritedSlot(Gated, &nodes);
+    const leader = &nodes[2];
+    var effects = Gated.Effects{};
+    try std.testing.expectError(error.LeaderCatchingUp, leader.propose(5, &effects));
+    var batch = [_]u64{ 5, 6 };
+    var slots: [2]Slot = undefined;
+    try std.testing.expectError(
+        error.LeaderCatchingUp,
+        leader.proposeBatch(&batch, &slots, &effects),
+    );
+
+    // Node 2 votes for the re-proposed slot 1 under the new ballot; with
+    // the leader's own durable vote that decides it, and the gate opens.
+    var accept: ?Gated.Envelope = null;
+    try leader.reconnected(2, &effects);
+    for (effects.messagesSlice()) |outbound| {
+        if (outbound.message == .accept and outbound.to == 2) accept = outbound;
+    }
+    try std.testing.expect(accept != null);
+    var inner = Gated.Effects{};
+    try nodes[1].step(accept.?, &inner);
+    inner.confirmWritesDurable();
+    for (inner.messagesSlice()) |reply| {
+        if (reply.message == .accepted) {
+            try leader.step(reply, &effects);
+            effects.confirmWritesDurable();
+        }
+    }
+    try std.testing.expectEqual(@as(Slot, 1), leader.decidedThrough());
+    try std.testing.expectEqual(@as(Slot, 2), leader.leaderBase());
+    try std.testing.expectEqual(@as(Slot, 2), try leader.propose(5, &effects));
 }
 
 test "the window continues past its size once the floor advances" {

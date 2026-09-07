@@ -26,6 +26,9 @@ pub const Options = struct {
     election_timeout_ticks: u32 = 10,
     heartbeat_interval_ticks: u32 = 3,
     resend_interval_ticks: u32 = 10,
+    /// Forwarded to the core: refuse proposals until the slots a new leader
+    /// inherited from earlier ballots are delivered.
+    gate_proposals_on_inherited_prefix: bool = false,
 };
 
 /// A bounded replicated log built on the explicit Paxos effect machine.
@@ -121,6 +124,7 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
         .election_timeout_ticks = options.election_timeout_ticks,
         .heartbeat_interval_ticks = options.heartbeat_interval_ticks,
         .resend_interval_ticks = options.resend_interval_ticks,
+        .gate_proposals_on_inherited_prefix = options.gate_proposals_on_inherited_prefix,
     });
 
     return struct {
@@ -427,6 +431,17 @@ pub fn ReplicatedLog(comptime Value: type, comptime options: Options) type {
                 return self.core.decidedThrough();
             }
 
+            /// Returns the first slot the current leadership may fill with a
+            /// new value; see the core's `leaderBase`.
+            pub fn leaderBase(self: *const Node) protocol.Slot {
+                return self.core.leaderBase();
+            }
+
+            /// Returns the slot the next append would take.
+            pub fn proposalFrontier(self: *const Node) protocol.Slot {
+                return self.core.proposalFrontier();
+            }
+
             /// Records that the host durably consumed every released entry
             /// through `through`, licensing consensus-cell reuse below it.
             pub fn advanceMemoryFloor(self: *Node, through: protocol.Slot) !void {
@@ -715,6 +730,42 @@ test "replicated log batches commands without allocation" {
     const result = try node.appendBatch(&.{ 3, 5, 8 }, &slots, &effects);
     try std.testing.expectEqualSlices(protocol.Slot, &.{ 1, 2, 3 }, result);
     try std.testing.expectEqual(@as(protocol.Slot, 3), node.decidedThrough());
+}
+
+test "the replicated log forwards the term base and proposal frontier" {
+    const Log = ReplicatedLog(u64, .{
+        .max_members = 1,
+        .window_slots = 4,
+        .max_batch = 2,
+        .gate_proposals_on_inherited_prefix = true,
+    });
+    var membership: Log.Membership = undefined;
+    try membership.init(&.{1});
+    var node: Log.Node = undefined;
+    try node.init(1, 1, &membership);
+    var effects = Log.Effects{};
+    try node.campaign(0, &effects);
+    // Deliver the self-addressed phase-one traffic the host would route.
+    var pending: [8]Log.Envelope = undefined;
+    while (true) {
+        effects.confirmWritesDurable();
+        var count: usize = 0;
+        for (effects.messagesSlice()) |envelope| {
+            if (envelope.to == 1) {
+                pending[count] = envelope;
+                count += 1;
+            }
+        }
+        if (count == 0) break;
+        for (pending[0..count]) |envelope| try node.step(envelope, &effects);
+    }
+    try std.testing.expect(node.core.role == .leader);
+    try std.testing.expectEqual(@as(protocol.Slot, 1), node.leaderBase());
+    try std.testing.expectEqual(@as(protocol.Slot, 1), node.proposalFrontier());
+    // A single member delivers everything it inherited during phase one,
+    // so the gate is open and the frontier advances with the append.
+    try std.testing.expectEqual(@as(protocol.Slot, 1), try node.append(9, &effects));
+    try std.testing.expectEqual(@as(protocol.Slot, 2), node.proposalFrontier());
 }
 
 test "reconfigure seals an epoch and initializes the next one" {
