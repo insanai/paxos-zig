@@ -27,7 +27,7 @@ function finish_function(end_line, line_count, name) {
 # their current size, so they can only shrink; re-pin to the new count
 # after each accepted shrink. The pins are recorded debt, not policy.
 function file_code_limit(name) {
-    if (name ~ /zaxonlite\/src\/server\.zig$/) return 4622
+    if (name ~ /zaxonlite\/src\/server\.zig$/) return 4617
     if (name ~ /zaxonlite\/src\/node\.zig$/) return 3335
     return 2800
 }
