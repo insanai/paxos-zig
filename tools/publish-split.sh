@@ -30,9 +30,13 @@ cd "$(git rev-parse --show-toplevel)"
 remote_base="git@github.com:insanai"
 
 # The released paxos-zig archive the published zaxonlite manifest pins.
-# Recompute the hash with `zig fetch <url>` when bumping the release.
-paxos_release_url="https://github.com/insanai/paxos-zig/archive/refs/tags/v0.6.0.tar.gz"
-paxos_release_hash="paxos-0.6.0-_zKMfWTUAwBtnIV2oOHECfG6cIltwPXBTgZRU5ubGTXI"
+# Resolve the real archive hash before any push; never guess a future tag hash.
+# Overrides allow a reviewed immutable commit archive before the tag exists.
+paxos_release_url="${PAXOS_RELEASE_URL:-https://github.com/insanai/paxos-zig/archive/refs/tags/v0.6.1.tar.gz}"
+paxos_release_hash="${PAXOS_RELEASE_HASH:-}"
+if [ -z "$paxos_release_hash" ]; then
+    paxos_release_hash="$(zig fetch "$paxos_release_url")"
+fi
 
 force=""
 for arg in "$@"; do
