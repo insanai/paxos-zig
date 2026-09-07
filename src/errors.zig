@@ -203,9 +203,7 @@ fn explainProgressError(err: anyerror) []const u8 {
         error.LeaderCatchingUp =>
         \\-- LEADER CATCHING UP -----------------------------------------------------------
         \\
-        \\Phase one succeeded, but slots inherited from earlier ballots are not yet
-        \\delivered and the gate option refuses new proposals until they are.
-        \\Hint: Deliver through leaderBase() - 1 (drive catch-up if needed), then retry.
+        \\Hint: Slots inherited in phase one are undelivered; deliver through leaderBase() - 1.
         ,
         error.WindowFull =>
         \\-- WINDOW FULL ------------------------------------------------------------------
