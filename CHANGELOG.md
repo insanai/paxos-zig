@@ -55,6 +55,22 @@ releases fail closed at open.
 - Model the design in `specs/GlobalTrim.tla`: the slot-tagged window,
   eviction licensing, trimmed-acceptor election fences, conservative
   trim, and the joiner lease lifecycle, with deliberate-bug validation.
+- Record the first slot of each leadership term in the core and expose it
+  as `leaderBase()` alongside `proposalFrontier()`. The opt-in
+  `gate_proposals_on_inherited_prefix` option refuses proposals with
+  `LeaderCatchingUp` until every slot inherited in phase one is delivered
+  (insanai/paxos-zig#1).
+- Admit a zaxonlite write only after the leader has applied everything
+  below its proposal frontier, and serve `leader` and `linearizable` reads
+  only after the inherited prefix is applied, so a freshly elected leader
+  can no longer capture a transaction batch on a stale chain base
+  (insanai/zaxonlite#5). A leader still owing itself inherited slots keeps
+  requesting catch-up and falls back to a state transfer; a decided chain
+  mismatch is reported with the failing check.
+- Add the takeover cluster scenario and the test-only
+  `--test-storage-delay-ms` and `--test-vote-delay-ms` flags that make it
+  deterministic.
+
 
 ## 0.2.0 - 2026-07-30
 
