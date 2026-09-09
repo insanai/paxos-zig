@@ -9,6 +9,8 @@
 - Interrupt outbound peer authentication and I/O during shutdown and transport
   replacement. Bound peer and gateway dialing and stop embedded servers through
   a local lifecycle signal, including failed-startup cleanup.
+- Skip the stop-reply grace period for local embedded shutdown; explicit
+  stop RPCs wait on reply completion with one monotonic 250 ms deadline.
 - Bound client connection establishment to ten seconds by default, across TCP
   or Unix connect, TLS, and PSK. Add explicit-deadline connection/RPC helpers and
   enforce one monotonic deadline for embedded startup readiness checks.
