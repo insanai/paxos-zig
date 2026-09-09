@@ -32,7 +32,7 @@ remote_base="git@github.com:insanai"
 # The released paxos-zig archive the published zaxonlite manifest pins.
 # Resolve the real archive hash before any push; never guess a future tag hash.
 # Overrides allow a reviewed immutable commit archive before the tag exists.
-paxos_release_url="${PAXOS_RELEASE_URL:-https://github.com/insanai/paxos-zig/archive/refs/tags/v0.6.1.tar.gz}"
+paxos_release_url="${PAXOS_RELEASE_URL:-https://github.com/insanai/paxos-zig/archive/refs/tags/v0.6.2.tar.gz}"
 paxos_release_hash="${PAXOS_RELEASE_HASH:-}"
 if [ -z "$paxos_release_hash" ]; then
     paxos_release_hash="$(zig fetch "$paxos_release_url")"
