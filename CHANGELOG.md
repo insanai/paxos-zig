@@ -15,6 +15,9 @@
 - Stop automatically replaying client requests after a transport failure once
   transmission begins. Seed connection failures and explicit leader redirects
   remain retryable; uncertain writes require session-based replay.
+- Read retained journal segments with sealed-segment validation, so trailers
+  are not mistaken for corrupt records during leader resynchronization,
+  range catch-up, integrity checks, or image rebuilding after rotation.
 - Align the Paxos, Zaxonlite, CLI UI, Python SDK, and book versions on 0.6.2.
   Wire and journal formats remain compatible with 0.6.1.
 
