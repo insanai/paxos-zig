@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.2 - 2026-09-09
+
+- Fix Zaxonlite shutdown hanging when writes, read fences, or condition waits
+  are blocked on consensus (insanai/zaxonlite#7). Shutdown and fatal failure
+  wake all host waiters independently of protocol ticks; unresolved writes
+  retain an unknown outcome, and failed condition waits cannot report success.
+- Interrupt outbound peer authentication and I/O during shutdown and transport
+  replacement. Bound peer and gateway dialing and stop embedded servers through
+  a local lifecycle signal, including failed-startup cleanup.
+- Bound client connection establishment to ten seconds by default, across TCP
+  or Unix connect, TLS, and PSK. Add explicit-deadline connection/RPC helpers and
+  enforce one monotonic deadline for embedded startup readiness checks.
+- Stop automatically replaying client requests after a transport failure once
+  transmission begins. Seed connection failures and explicit leader redirects
+  remain retryable; uncertain writes require session-based replay.
+- Align the Paxos, Zaxonlite, CLI UI, Python SDK, and book versions on 0.6.2.
+  Wire and journal formats remain compatible with 0.6.1.
+
 ## 0.6.1 - 2026-09-07
 
 - Record the first slot of each leadership term in the core and expose it
