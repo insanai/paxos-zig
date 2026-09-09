@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Avoid a macOS panic in Zig 0.16 when an interrupted socket connection
+  completes before the runtime retries it. TCP and Unix connections now issue
+  one nonblocking connect and wait cancelably for completion, preserving the
+  existing connection deadline and restoring blocking mode before handoff.
+
 ## 0.6.2 - 2026-09-09
 
 - Fix Zaxonlite shutdown hanging when writes, read fences, or condition waits
